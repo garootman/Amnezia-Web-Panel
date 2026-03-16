@@ -2,7 +2,26 @@
 
 A modern, high-performance web interface for simplified management of AmneziaWG and Xray (XTLS-Reality) servers. Designed to provide a premium user experience with robust administrative capabilities.
 
-![Interface Preview](https://github.com/user-attachments/assets/preview_placeholder.png)
+![Servers Dashboard](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/screen/panel1.png)
+
+
+### Additional Sections
+
+<details>
+<summary><b>👥 Users Management</b> (click to expand)</summary>
+<br>
+User management interface with permissions and access controls:
+
+![Users Management](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/screen/panel1-2.png)
+</details>
+
+<details>
+<summary><b>⚙️ System Settings</b> (click to expand)</summary>
+<br>
+Configuration panel for system parameters and preferences:
+
+![Settings Panel](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/screen/panel1-3.png)
+</details>
 
 ## 🚀 Key Features
 
