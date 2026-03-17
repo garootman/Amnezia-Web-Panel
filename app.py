@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import logging
 import base64
@@ -39,7 +40,12 @@ app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', se
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), 'data.json')
+if getattr(sys, 'frozen', False):
+    application_path = os.path.dirname(sys.executable)
+else:
+    application_path = os.path.dirname(__file__)
+
+DATA_FILE = os.path.join(application_path, 'data.json')
 
 
 # ======================== Translations ========================
