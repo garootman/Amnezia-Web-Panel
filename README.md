@@ -67,16 +67,15 @@ Configuration panel for system parameters and preferences:
 
 If you require any custom features not currently available in the panel, **let us know – we'll implement them quickly!** 
 
-**Or better yet, contribute by adding:**
-
 * **Database Support**: PostgreSQL, MySQL/MariaDB, SQLite, Oracle, and MS SQL Server
 * **In-Panel File Editor**: Edit configuration files inside containers directly from the web interface
-* **Backup & Restore**: Comprehensive backup solutions for nodes and protocols
+* **Backup & Restore nodes/protocols**: Comprehensive backup solutions for nodes and protocols
 * **Protocol Migration**: Seamlessly move protocols between nodes
 * **Xray Self-Steal Mode**: Advanced Xray configuration with self-steal functionality
 * **And much more!**
 
-Your contributions and feature requests help make this project better for everyone! 🚀
+**Or better yet, contribute by adding:**
+
 
 ## 🏗 Prerequisites
 
