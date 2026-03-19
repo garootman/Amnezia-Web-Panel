@@ -83,7 +83,7 @@ If you require any custom features not currently available in the panel, **let u
 *   Target servers: **Ubuntu 20.04/22.04/24.04** (Architecture: x86_64 or ARM64).
 *   SSH access to target servers (Password or Private Key).
 
-## 📦 Installation
+## 📦 Installation 
 
 1.  **Clone the repository**:
     ```bash
@@ -101,9 +101,16 @@ If you require any custom features not currently available in the panel, **let u
     ```bash
     pip install -r requirements.txt
     ```
+## 📦 Installation Method 2
 
+Download and run the executable file for your system.
+```
+Windows
+Linux
+Mac
+```
 
-## 🐳 Docker Installation
+## 🐳 Docker Image
 
 https://hub.docker.com/r/prvtpro/amnezia-panel
 
