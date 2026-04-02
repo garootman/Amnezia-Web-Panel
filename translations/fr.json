@@ -244,5 +244,14 @@
     "invalid_backup_file": "Fichier de sauvegarde ou structure invalide",
     "config_unavailable": "Configuration indisponible",
     "config_unavailable_desc": "Ce client a été créé via l'application native Amnezia.\\nLa clé privée est stockée uniquement sur l'appareil de l'utilisateur et ne peut pas être récupérée par le serveur.",
-    "client_public_key": "Clé publique du client :"
+    "client_public_key": "Clé publique du client :",
+    "management": "Gestion",
+    "server_management": "Gestion du serveur",
+    "server_management_desc": "Effectuer des actions au niveau du système sur votre machine.",
+    "check_server_services": "Vérifier les services du serveur",
+    "reboot_server": "Redémarrer le serveur",
+    "clear_server": "Réinitialiser le serveur",
+    "remove_server": "Retirer le serveur du panneau",
+    "telemt_desc": "Proxy Telegram basé sur MTProxy avec obfuscation avancée.",
+    "dns_desc": "Serveur DNS personnel pour bloquer les publicités et protéger la vie privée."
 }

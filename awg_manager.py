@@ -65,7 +65,7 @@ def generate_psk():
     return b64encode(secrets.token_bytes(32)).decode()
 
 
-def generate_awg_params():
+def generate_awg_params(use_ranges=False):
     """Generate random AWG obfuscation parameters."""
     import random
     jc = random.randint(1, 10)
@@ -75,10 +75,19 @@ def generate_awg_params():
     s2 = random.randint(10, 50)
     s3 = random.randint(10, 50)
     s4 = random.randint(10, 50)
-    h1 = random.randint(100000000, 4294967295)
-    h2 = random.randint(100000000, 4294967295)
-    h3 = random.randint(100000000, 4294967295)
-    h4 = random.randint(100000000, 4294967295)
+
+    if use_ranges:
+        # Standard AWG 2.0 headers are ranges
+        h1 = f"{random.randint(1, 10000)}-{random.randint(10001, 4294967295)}"
+        h2 = f"{random.randint(1, 10000)}-{random.randint(10001, 4294967295)}"
+        h3 = f"{random.randint(1, 10000)}-{random.randint(10001, 4294967295)}"
+        h4 = f"{random.randint(1, 10000)}-{random.randint(10001, 4294967295)}"
+    else:
+        h1 = str(random.randint(100000000, 4294967295))
+        h2 = str(random.randint(100000000, 4294967295))
+        h3 = str(random.randint(100000000, 4294967295))
+        h4 = str(random.randint(100000000, 4294967295))
+
     return {
         'junk_packet_count': str(jc),
         'junk_packet_min_size': str(jmin),
@@ -87,10 +96,10 @@ def generate_awg_params():
         'response_packet_junk_size': str(s2),
         'cookie_reply_packet_junk_size': str(s3),
         'transport_packet_junk_size': str(s4),
-        'init_packet_magic_header': str(h1),
-        'response_packet_magic_header': str(h2),
-        'underload_packet_magic_header': str(h3),
-        'transport_packet_magic_header': str(h4),
+        'init_packet_magic_header': h1,
+        'response_packet_magic_header': h2,
+        'underload_packet_magic_header': h3,
+        'transport_packet_magic_header': h4,
     }
 
 
@@ -242,7 +251,7 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             port = AWG_DEFAULTS['port']
 
         if awg_params is None:
-            awg_params = generate_awg_params()
+            awg_params = generate_awg_params(use_ranges=(protocol_type in (self.AWG, self.AWG2)))
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
@@ -415,6 +424,13 @@ H1 = {awg_params['init_packet_magic_header']}
 H2 = {awg_params['response_packet_magic_header']}
 H3 = {awg_params['underload_packet_magic_header']}
 H4 = {awg_params['transport_packet_magic_header']}
+# Signature Chain parameters (AWG 2.0+)
+# I1 = 0
+# I2 = 0
+# I3 = 0
+# I4 = 0
+# I5 = 0
+# CPS = signature
 EOF
 """
         else:
@@ -601,6 +617,7 @@ tail -f /dev/null
         """Extract AWG obfuscation params from server config."""
         config = self._get_server_config(protocol_type)
         params = {}
+        # Mapping from server config keys to our param dictionary keys
         param_map = {
             'ListenPort': 'port',
             'Jc': 'junk_packet_count',
@@ -614,16 +631,23 @@ tail -f /dev/null
             'H2': 'response_packet_magic_header',
             'H3': 'underload_packet_magic_header',
             'H4': 'transport_packet_magic_header',
+            'I1': 'i1',
+            'I2': 'i2',
+            'I3': 'i3',
+            'I4': 'i4',
+            'I5': 'i5',
+            'CPS': 'cps',
         }
 
         for line in config.split('\n'):
             line = line.strip()
-            if ' = ' in line and not line.startswith('#') and not line.startswith('['):
-                parts = line.split(' = ', 1)
+            # Support both 'key=value' and 'key = value'
+            if '=' in line and not line.startswith('#') and not line.startswith('['):
+                parts = line.split('=', 1)
                 key = parts[0].strip()
-                value = parts[1].strip()
+                val = parts[1].strip()
                 if key in param_map:
-                    params[param_map[key]] = value
+                    params[param_map[key]] = val
 
         return params
 
@@ -866,47 +890,44 @@ AllowedIPs = {client_ip}/32
         dns2 = AWG_DEFAULTS['dns2']
         mtu = AWG_DEFAULTS['mtu']
 
-        if protocol_type in (self.AWG, self.AWG2):
-            client_config = f"""[Interface]
-Address = {client_ip}/32
-DNS = {dns1}, {dns2}
-PrivateKey = {client_priv_key}
-MTU = {mtu}
-Jc = {awg_params.get('junk_packet_count', '')}
-Jmin = {awg_params.get('junk_packet_min_size', '')}
-Jmax = {awg_params.get('junk_packet_max_size', '')}
-S1 = {awg_params.get('init_packet_junk_size', '')}
-S2 = {awg_params.get('response_packet_junk_size', '')}
-S3 = {awg_params.get('cookie_reply_packet_junk_size', '')}
-S4 = {awg_params.get('transport_packet_junk_size', '')}
-H1 = {awg_params.get('init_packet_magic_header', '')}
-H2 = {awg_params.get('response_packet_magic_header', '')}
-H3 = {awg_params.get('underload_packet_magic_header', '')}
-H4 = {awg_params.get('transport_packet_magic_header', '')}
+        # Standard fields
+        config_lines = [
+            f"Address = {client_ip}/32",
+            f"DNS = {dns1}, {dns2}",
+            f"PrivateKey = {client_priv_key}",
+            f"MTU = {mtu}"
+        ]
 
-[Peer]
-PublicKey = {server_pub_key}
-PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = {server_host}:{port}
-PersistentKeepalive = 25
-"""
-        else:
-            # AWG Legacy (no S3, S4)
-            client_config = f"""[Interface]
-Address = {client_ip}/32
-DNS = {dns1}, {dns2}
-PrivateKey = {client_priv_key}
-MTU = {mtu}
-Jc = {awg_params.get('junk_packet_count', '')}
-Jmin = {awg_params.get('junk_packet_min_size', '')}
-Jmax = {awg_params.get('junk_packet_max_size', '')}
-S1 = {awg_params.get('init_packet_junk_size', '')}
-S2 = {awg_params.get('response_packet_junk_size', '')}
-H1 = {awg_params.get('init_packet_magic_header', '')}
-H2 = {awg_params.get('response_packet_magic_header', '')}
-H3 = {awg_params.get('underload_packet_magic_header', '')}
-H4 = {awg_params.get('transport_packet_magic_header', '')}
+        # Conditional obfuscation fields
+        mapping = [
+            ('junk_packet_count', 'Jc'),
+            ('junk_packet_min_size', 'Jmin'),
+            ('junk_packet_max_size', 'Jmax'),
+            ('init_packet_junk_size', 'S1'),
+            ('response_packet_junk_size', 'S2'),
+            ('cookie_reply_packet_junk_size', 'S3'),
+            ('transport_packet_junk_size', 'S4'),
+            ('init_packet_magic_header', 'H1'),
+            ('response_packet_magic_header', 'H2'),
+            ('underload_packet_magic_header', 'H3'),
+            ('transport_packet_magic_header', 'H4'),
+            ('i1', 'I1'),
+            ('i2', 'I2'),
+            ('i3', 'I3'),
+            ('i4', 'I4'),
+            ('i5', 'I5'),
+            ('cps', 'CPS')
+        ]
+
+        for param_key, config_key in mapping:
+            val = awg_params.get(param_key)
+            if val:
+                # Basic compatibility filtering
+                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                    continue
+                config_lines.append(f"{config_key} = {val}")
+
+        client_config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
@@ -955,46 +976,44 @@ PersistentKeepalive = 25
         dns2 = AWG_DEFAULTS['dns2']
         mtu = AWG_DEFAULTS['mtu']
 
-        if protocol_type in (self.AWG, self.AWG2):
-            config = f"""[Interface]
-Address = {client_ip}/32
-DNS = {dns1}, {dns2}
-PrivateKey = {client_priv_key}
-MTU = {mtu}
-Jc = {awg_params.get('junk_packet_count', '')}
-Jmin = {awg_params.get('junk_packet_min_size', '')}
-Jmax = {awg_params.get('junk_packet_max_size', '')}
-S1 = {awg_params.get('init_packet_junk_size', '')}
-S2 = {awg_params.get('response_packet_junk_size', '')}
-S3 = {awg_params.get('cookie_reply_packet_junk_size', '')}
-S4 = {awg_params.get('transport_packet_junk_size', '')}
-H1 = {awg_params.get('init_packet_magic_header', '')}
-H2 = {awg_params.get('response_packet_magic_header', '')}
-H3 = {awg_params.get('underload_packet_magic_header', '')}
-H4 = {awg_params.get('transport_packet_magic_header', '')}
+        # Standard fields
+        config_lines = [
+            f"Address = {client_ip}/32",
+            f"DNS = {dns1}, {dns2}",
+            f"PrivateKey = {client_priv_key}",
+            f"MTU = {mtu}"
+        ]
 
-[Peer]
-PublicKey = {server_pub_key}
-PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = {server_host}:{port}
-PersistentKeepalive = 25
-"""
-        else:
-            config = f"""[Interface]
-Address = {client_ip}/32
-DNS = {dns1}, {dns2}
-PrivateKey = {client_priv_key}
-MTU = {mtu}
-Jc = {awg_params.get('junk_packet_count', '')}
-Jmin = {awg_params.get('junk_packet_min_size', '')}
-Jmax = {awg_params.get('junk_packet_max_size', '')}
-S1 = {awg_params.get('init_packet_junk_size', '')}
-S2 = {awg_params.get('response_packet_junk_size', '')}
-H1 = {awg_params.get('init_packet_magic_header', '')}
-H2 = {awg_params.get('response_packet_magic_header', '')}
-H3 = {awg_params.get('underload_packet_magic_header', '')}
-H4 = {awg_params.get('transport_packet_magic_header', '')}
+        # Conditional obfuscation fields
+        mapping = [
+            ('junk_packet_count', 'Jc'),
+            ('junk_packet_min_size', 'Jmin'),
+            ('junk_packet_max_size', 'Jmax'),
+            ('init_packet_junk_size', 'S1'),
+            ('response_packet_junk_size', 'S2'),
+            ('cookie_reply_packet_junk_size', 'S3'),
+            ('transport_packet_junk_size', 'S4'),
+            ('init_packet_magic_header', 'H1'),
+            ('response_packet_magic_header', 'H2'),
+            ('underload_packet_magic_header', 'H3'),
+            ('transport_packet_magic_header', 'H4'),
+            ('i1', 'I1'),
+            ('i2', 'I2'),
+            ('i3', 'I3'),
+            ('i4', 'I4'),
+            ('i5', 'I5'),
+            ('cps', 'CPS')
+        ]
+
+        for param_key, config_key in mapping:
+            val = awg_params.get(param_key)
+            if val:
+                # Basic compatibility filtering
+                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                    continue
+                config_lines.append(f"{config_key} = {val}")
+
+        config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
 [Peer]
 PublicKey = {server_pub_key}

@@ -44,6 +44,10 @@ Configuration panel for system parameters and preferences:
     *   **AmneziaWG**: Advanced WireGuard-based protocol with S3/S4 obfuscation to bypass deep packet inspection (DPI).
     *   **Xray (XTLS-Reality)**: Stealthy protocol that masks VPN traffic as standard HTTPS browsing.
     *   **Telemt (Telegram Proxy)**: High-performance Telegram MTProxy with TLS emulation and comprehensive management (quotas, IP limits, and real-time session tracking).
+    *   **AmneziaDNS**: Internal DNS resolver overriding default behavior to prevent DNS leaks and blockings.
+*   **⚙️ Core Server Management**:
+    *   Reboot servers and perform full Amnezia software cleanup directly from the UI.
+    *   Lightning-fast, strictly concurrent protocol status polling for immediate feedback.
 *   **🌐 Internationalization (i18n)**:
     *   Full support for **English**, **Russian**, **French**, **Chinese**, and **Persian**.
     *   Native **RTL (Right-to-Left)** support for Persian language.
@@ -138,6 +142,8 @@ https://hub.docker.com/r/prvtpro/amnezia-panel
 The project includes self-documenting API endpoints:
 *   **Swagger UI**: `/docs`
 *   **ReDoc**: `/redoc`
+
+> **Note:** The current API is designed exclusively for internal panel operations (requires session authentication). A dedicated public REST API for external integrations is not yet available and would need to be implemented.
 
 ### Technology Stack
 *   **Backend**: FastAPI (Python)

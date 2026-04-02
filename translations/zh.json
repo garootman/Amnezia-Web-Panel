@@ -244,5 +244,14 @@
     "invalid_backup_file": "备份文件无效或结构错误",
     "config_unavailable": "配置文件不可用",
     "config_unavailable_desc": "此客户端是通过 Amnezia 原生应用创建的。\\n私钥仅存储在用户设备上，服务器无法恢复。",
-    "client_public_key": "客户端公钥："
+    "client_public_key": "客户端公钥：",
+    "management": "管理",
+    "server_management": "服务器管理",
+    "server_management_desc": "在您的机器上执行系统级别的操作。",
+    "check_server_services": "检查服务器服务",
+    "reboot_server": "重启服务器",
+    "clear_server": "清除服务器",
+    "remove_server": "从面板移除服务器",
+    "telemt_desc": "基于 MTProxy 的 Telegram 代理，支持高级混淆。",
+    "dns_desc": "防止广告和保护隐私的个人 DNS 服务器。"
 }

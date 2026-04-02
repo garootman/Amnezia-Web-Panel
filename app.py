@@ -134,6 +134,9 @@ def get_protocol_manager(ssh, protocol: str):
     elif protocol == 'telemt':
         from telemt_manager import TelemtManager
         return TelemtManager(ssh)
+    elif protocol == 'dns':
+        from dns_manager import DNSManager
+        return DNSManager(ssh)
     from awg_manager import AWGManager
     return AWGManager(ssh)
 
@@ -514,6 +517,7 @@ class AddUserRequest(BaseModel):
     email: Optional[str] = None
     description: Optional[str] = None
     traffic_limit: Optional[float] = 0
+    traffic_reset_strategy: Optional[str] = 'never'
     server_id: Optional[int] = None
     protocol: Optional[str] = None
     connection_name: Optional[str] = None
@@ -555,6 +559,7 @@ class UpdateUserRequest(BaseModel):
     email: Optional[str] = None
     description: Optional[str] = None
     traffic_limit: Optional[float] = 0
+    traffic_reset_strategy: Optional[str] = None
     password: Optional[str] = None
 
 
@@ -606,7 +611,7 @@ async def startup():
         changed = True
         logger.info("Default admin created (admin / admin)")
     
-    # Migration for sharing fields
+    # Migration for sharing fields and traffic reset strategy
     for u in data['users']:
         migrated = False
         if 'share_enabled' not in u:
@@ -618,9 +623,21 @@ async def startup():
         if 'share_password_hash' not in u:
             u['share_password_hash'] = None
             migrated = True
+        
+        # Traffic reset strategy and total traffic
+        if 'traffic_reset_strategy' not in u:
+            u['traffic_reset_strategy'] = 'never'
+            migrated = True
+        if 'traffic_total' not in u:
+            u['traffic_total'] = u.get('traffic_used', 0)
+            migrated = True
+        if 'last_reset_at' not in u:
+            u['last_reset_at'] = datetime.now().isoformat()
+            migrated = True
+            
         if migrated:
             changed = True
-            logger.info(f"Migrated sharing fields for user {u['username']}")
+            logger.info(f"Migrated user {u['username']} to new traffic/sharing fields")
             
     if changed:
         save_data(data)
@@ -658,7 +675,7 @@ async def periodic_background_tasks():
                 try:
                     ssh = get_ssh(server)
                     ssh.connect()
-                    for proto in ['awg', 'awg2', 'awg_legacy', 'xray']:
+                    for proto in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt']:
                         if proto in server.get('protocols', {}):
                             manager = get_protocol_manager(ssh, proto)
                             clients = manager.get_clients(proto)
@@ -686,13 +703,41 @@ async def periodic_background_tasks():
                     uc_list = curr_data.get('user_connections', [])
                     uc_map = {uc['id']: uc for uc in uc_list}
                     
+                    # Current date/time for reset checking
+                    now = datetime.now()
+                    
                     for uc_id, delta, curr_bytes in updates:
                         if uc_id in uc_map:
                             uc_map[uc_id]['last_bytes'] = curr_bytes
                             uid = uc_map[uc_id]['user_id']
                             if uid in users_map:
                                 u = users_map[uid]
+                                # Check if reset is needed BEFORE adding new consumption
+                                strategy = u.get('traffic_reset_strategy', 'never')
+                                last_reset_iso = u.get('last_reset_at')
+                                
+                                reset_needed = False
+                                if strategy != 'never' and last_reset_iso:
+                                    try:
+                                        last = datetime.fromisoformat(last_reset_iso)
+                                        if strategy == 'daily':
+                                            reset_needed = now.date() > last.date()
+                                        elif strategy == 'weekly':
+                                            reset_needed = now.isocalendar()[1] != last.isocalendar()[1] or now.year != last.year
+                                        elif strategy == 'monthly':
+                                            reset_needed = now.month != last.month or now.year != last.year
+                                    except:
+                                        pass
+                                
+                                if reset_needed:
+                                    logger.info(f"Resetting traffic for user {u['username']} (strategy: {strategy})")
+                                    u['traffic_used'] = 0
+                                    u['last_reset_at'] = now.isoformat()
+                                
+                                # Update both resettable and total traffic
                                 u['traffic_used'] = u.get('traffic_used', 0) + delta
+                                u['traffic_total'] = u.get('traffic_total', 0) + delta
+                                
                                 limit = u.get('traffic_limit', 0)
                                 if limit > 0 and u['traffic_used'] >= limit and u.get('enabled', True):
                                     if uid not in to_disable_uids:
@@ -918,6 +963,58 @@ async def api_delete_server(request: Request, server_id: int):
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/reboot')
+async def api_reboot_server(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            ssh.run_sudo_command("nohup reboot > /dev/null 2>&1 &")
+        except Exception:
+            pass            
+        try:
+            ssh.disconnect()
+        except:
+            pass
+        return {'status': 'success'}
+    except Exception as e:
+        logger.exception("Error rebooting server")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/clear')
+async def api_clear_server(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        containers = ['amnezia-awg', 'amnezia-awg2', 'amnezia-awg-legacy', 'amnezia-xray', 'telemt', 'amnezia-dns']
+        for c in containers:
+            ssh.run_sudo_command(f"docker stop {c} || true")
+            ssh.run_sudo_command(f"docker rm {c} || true")
+        ssh.run_sudo_command("docker network rm amnezia-dns-net || true")
+        ssh.run_sudo_command("rm -rf /opt/amnezia")
+        
+        server['protocols'] = {}
+        save_data(data)
+        ssh.disconnect()
+        return {'status': 'success'}
+    except Exception as e:
+        logger.exception("Error clearing server")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/stats')
 async def api_server_stats(request: Request, server_id: int):
     if not _check_admin(request):
@@ -990,33 +1087,39 @@ async def api_check_server(request: Request, server_id: int):
         if 'protocols' not in server:
             server['protocols'] = {}
 
-        for proto in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt']:
+        import concurrent.futures
+
+        def check_proto(proto):
             try:
                 p_manager = get_protocol_manager(ssh, proto)
                 result = p_manager.get_server_status(proto)
-                
-                # Check if we have port in DB already
                 db_proto = server.get('protocols', {}).get(proto, {})
                 if not result.get('port') and db_proto.get('port'):
                     result['port'] = db_proto['port']
-                    
-                status['protocols'][proto] = result
-                
-                # Auto-sync panel data based on external state
-                if result.get('container_exists'):
-                    if proto not in server['protocols']:
-                        server['protocols'][proto] = {
-                            'installed': True,
-                            'port': result.get('port', '55424'),
-                            'awg_params': result.get('awg_params', {})
-                        }
-                        changed = True
-                else:
-                    if proto in server['protocols']:
-                        del server['protocols'][proto]
-                        changed = True
+                return proto, result, None
             except Exception as e:
-                status['protocols'][proto] = {'error': str(e)}
+                return proto, None, str(e)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns']]
+            for future in concurrent.futures.as_completed(futures):
+                proto, result, err = future.result()
+                if err:
+                    status['protocols'][proto] = {'error': err}
+                else:
+                    status['protocols'][proto] = result
+                    if result.get('container_exists'):
+                        if proto not in server['protocols']:
+                            server['protocols'][proto] = {
+                                'installed': True,
+                                'port': result.get('port', '55424'),
+                                'awg_params': result.get('awg_params', {})
+                            }
+                            changed = True
+                    else:
+                        if proto in server['protocols']:
+                            del server['protocols'][proto]
+                            changed = True
                 
         if changed:
             save_data(data)
@@ -1036,7 +1139,7 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
-        if req.protocol not in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt']:
+        if req.protocol not in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns']:
             return JSONResponse({'error': 'Invalid protocol type'}, status_code=400)
         
         server = data['servers'][server_id]
@@ -1102,6 +1205,7 @@ CONTAINER_NAMES = {
     'awg_legacy': 'amnezia-awg-legacy',
     'xray': 'amnezia-xray',
     'telemt': 'telemt',
+    'dns': 'amnezia-dns',
 }
 
 
@@ -1445,7 +1549,10 @@ async def api_list_users(request: Request, search: str = '', page: int = 1, size
             'description': u.get('description'),
             'connections_count': sum(1 for c in conns if c['user_id'] == u['id']),
             'traffic_used': u.get('traffic_used', 0),
+            'traffic_total': u.get('traffic_total', 0),
             'traffic_limit': u.get('traffic_limit', 0),
+            'traffic_reset_strategy': u.get('traffic_reset_strategy', 'never'),
+            'last_reset_at': u.get('last_reset_at'),
             'share_enabled': u.get('share_enabled', False),
             'share_token': u.get('share_token'),
             'has_share_password': bool(u.get('share_password_hash')),
@@ -1482,7 +1589,10 @@ async def api_add_user(request: Request, req: AddUserRequest):
             'email': req.email,
             'description': req.description,
             'traffic_limit': int(req.traffic_limit * 1024**3) if req.traffic_limit else 0,
+            'traffic_reset_strategy': req.traffic_reset_strategy or 'never',
             'traffic_used': 0,
+            'traffic_total': 0,
+            'last_reset_at': datetime.now().isoformat(),
             'enabled': True,
             'created_at': datetime.now().isoformat(),
             'remnawave_uuid': None,
@@ -1547,6 +1657,10 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if req.traffic_limit is not None: 
             new_limit = int(req.traffic_limit * 1024**3)
             user['traffic_limit'] = new_limit
+        
+        if req.traffic_reset_strategy is not None:
+            user['traffic_reset_strategy'] = req.traffic_reset_strategy
+            user['last_reset_at'] = datetime.now().isoformat()
             
         if req.password:
             user['password_hash'] = hash_password(req.password)

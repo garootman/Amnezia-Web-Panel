@@ -206,6 +206,10 @@ class SSHManager:
         out, err, code = self.run_command("uname -sr && cat /etc/os-release 2>/dev/null | head -2")
         return out
 
+    def write_file(self, remote_path, content):
+        """Write content to a remote file with sudo."""
+        return self.upload_file_sudo(content, remote_path)
+
     def __enter__(self):
         self.connect()
         return self

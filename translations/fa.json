@@ -244,5 +244,14 @@
     "invalid_backup_file": "فایل پشتیبان یا ساختار نامعتبر است",
     "config_unavailable": "پیکربندی در دسترس نیست",
     "config_unavailable_desc": "این کلاینت از طریق اپلیکیشن اصلی Amnezia ایجاد شده است.\\nکلید خصوصی فقط در دستگاه کاربر ذخیره می‌شود و توسط سرور قابل بازیابی نیست.",
-    "client_public_key": "کلید عمومی کلاینت:"
+    "client_public_key": "کلید عمومی کلاینت:",
+    "management": "مدیریت",
+    "server_management": "مدیریت سرور",
+    "server_management_desc": "انجام اقدامات در سطح سیستم روی دستگاه شما.",
+    "check_server_services": "بررسی سرویس‌های سرور",
+    "reboot_server": "راه‌اندازی مجدد سرور",
+    "clear_server": "پاک‌سازی سرور",
+    "remove_server": "حذف سرور از پنل",
+    "telemt_desc": "پروکسی تلگرام بر پایه‌ی MTProxy با پوشش‌های پیشرفته.",
+    "dns_desc": "سرور DNS شخصی برای مسدود کردن تبلیغات و حفظ حریم خصوصی."
 }
