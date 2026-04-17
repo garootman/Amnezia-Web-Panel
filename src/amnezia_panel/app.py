@@ -407,11 +407,7 @@ async def sync_users_with_remnawave(data: dict):
                     # Fall back to username match ONLY for users that were already Remnawave-imported
                     # (empty password_hash). Never hijack a local admin account that shares a username.
                     local_u = next(
-                        (
-                            u
-                            for u in data["users"]
-                            if u["username"] == rw_u["username"] and not u.get("password_hash")
-                        ),
+                        (u for u in data["users"] if u["username"] == rw_u["username"] and not u.get("password_hash")),
                         None,
                     )
 
