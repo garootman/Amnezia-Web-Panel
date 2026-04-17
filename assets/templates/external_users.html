@@ -97,10 +97,54 @@
     </div>
 </div>
 
+<!-- ===== Add Connection Modal ===== -->
+<div class="modal-backdrop" id="addConnModal">
+    <div class="modal">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _('ext_add_connection') }}</h2>
+            <button class="modal-close" onclick="closeModal('addConnModal')">×</button>
+        </div>
+        <form id="addConnForm" onsubmit="return addConnection(event)">
+            <input type="hidden" id="addConnExtId">
+            <div class="form-group">
+                <label class="form-label">{{ _('ext_server') }}</label>
+                <select class="form-select" id="addConnServer" required></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">{{ _('protocol') or 'Protocol' }}</label>
+                <select class="form-select" id="addConnProtocol" required></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">{{ _('ext_users_label') }}</label>
+                <input class="form-input" type="text" id="addConnLabel">
+            </div>
+            <div style="text-align: right; margin-top: var(--space-md);">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('addConnModal')">{{ _('cancel') }}</button>
+                <button type="submit" class="btn btn-primary">{{ _('save') }}</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- ===== Config Modal ===== -->
+<div class="modal-backdrop" id="connConfigModal">
+    <div class="modal" style="max-width: 640px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _('ext_connection_config') }}</h2>
+            <button class="modal-close" onclick="closeModal('connConfigModal')">×</button>
+        </div>
+        <div id="connConfigBody"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
 <script>
     let currentPage = 1;
     let currentSearch = "";
     let searchTimer = null;
+    let currentExtId = null;
+    let cachedServers = null;
 
     function onSearch(v) {
         clearTimeout(searchTimer);
@@ -121,6 +165,8 @@
             const data = await apiCall('/api/admin/external_users?' + params.toString());
             renderTable(data);
         } catch (e) {
+            document.getElementById('extUsersTbody').innerHTML =
+                `<tr><td colspan="7" style="padding: var(--space-lg); text-align: center; color: var(--danger);">${e.message}</td></tr>`;
             showToast(e.message, 'error');
         }
     }
@@ -173,6 +219,7 @@
     }
 
     async function openDetail(externalId) {
+        currentExtId = externalId;
         document.getElementById('extDetailTitle').textContent = externalId;
         document.getElementById('extDetailBody').innerHTML = `<div style="text-align:center; padding: var(--space-lg);">${_('loading')}</div>`;
         openModal('extDetailModal');
@@ -185,13 +232,18 @@
     }
 
     function renderDetail(u) {
-        const conns = (u.connections || []).map(c => `
+        const rows = (u.connections || []).map(c => `
             <tr style="border-bottom: 1px solid var(--border-color);">
                 <td style="padding: var(--space-sm); font-family: monospace; font-size: 0.8rem;">${c.id.slice(0, 8)}…</td>
                 <td style="padding: var(--space-sm);">${c.protocol}</td>
                 <td style="padding: var(--space-sm);">${c.server_label || '?'} ${c.region ? `<span class="badge badge-info">${c.region}</span>` : ''}</td>
                 <td style="padding: var(--space-sm);">${c.enabled ? '✓' : '✕'}</td>
                 <td style="padding: var(--space-sm);">${(c.traffic_used / (1024**3)).toFixed(2)} GB</td>
+                <td style="padding: var(--space-sm); white-space: nowrap;">
+                    <button class="btn btn-secondary btn-sm" onclick="showConnConfig('${c.id}')" title="${_('ext_connection_config')}">📱</button>
+                    <button class="btn btn-secondary btn-sm" onclick="toggleConnection('${c.id}', ${!c.enabled})" title="${c.enabled ? _('ext_disable') : _('ext_enable')}">${c.enabled ? '⏸' : '▶'}</button>
+                    <button class="btn btn-danger btn-sm" onclick="removeConnection('${c.id}')" title="${_('delete')}">✕</button>
+                </td>
             </tr>
         `).join('');
         document.getElementById('extDetailBody').innerHTML = `
@@ -199,12 +251,22 @@
                 <div><strong>${_('ext_users_status')}:</strong> ${badgeForStatus(u.status)}</div>
                 <div><strong>${_('ext_users_expires')}:</strong> ${(u.expires_at || '').slice(0, 16).replace('T', ' ')}</div>
             </div>
-            <h3 style="margin-top: var(--space-lg);">${_('connections')}</h3>
-            <table class="data-table" style="width: 100%; border-collapse: collapse;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-top: var(--space-lg);">
+                <h3 style="margin:0;">${_('connections')}</h3>
+                <button class="btn btn-primary btn-sm" onclick="openAddConnModal()">＋ ${_('ext_add_connection')}</button>
+            </div>
+            <table class="data-table" style="width: 100%; border-collapse: collapse; margin-top: var(--space-sm);">
                 <thead>
-                    <tr><th style="padding: var(--space-sm); text-align: left;">id</th><th style="padding: var(--space-sm); text-align: left;">${_('protocol')||'protocol'}</th><th style="padding: var(--space-sm); text-align: left;">${_('host')}</th><th style="padding: var(--space-sm); text-align: left;">${_('status')}</th><th style="padding: var(--space-sm); text-align: left;">${_('traffic')}</th></tr>
+                    <tr>
+                        <th style="padding: var(--space-sm); text-align: left;">id</th>
+                        <th style="padding: var(--space-sm); text-align: left;">${_('protocol') || 'Protocol'}</th>
+                        <th style="padding: var(--space-sm); text-align: left;">${_('host')}</th>
+                        <th style="padding: var(--space-sm); text-align: left;">${_('status')}</th>
+                        <th style="padding: var(--space-sm); text-align: left;">${_('traffic')}</th>
+                        <th style="padding: var(--space-sm); text-align: left;">${_('actions')}</th>
+                    </tr>
                 </thead>
-                <tbody>${conns || `<tr><td colspan="5" style="padding: var(--space-md); text-align:center; color: var(--text-muted);">—</td></tr>`}</tbody>
+                <tbody>${rows || `<tr><td colspan="6" style="padding: var(--space-md); text-align:center; color: var(--text-muted);">—</td></tr>`}</tbody>
             </table>
 
             <div style="display: flex; gap: var(--space-sm); margin-top: var(--space-lg); flex-wrap: wrap;">
@@ -238,23 +300,104 @@
     async function deleteExtUser(externalId) {
         if (!confirm(_('ext_delete_confirm'))) return;
         try {
-            await fetch('/api/admin/external_users/' + encodeURIComponent(externalId), { method: 'DELETE' });
+            await apiCall('/api/admin/external_users/' + encodeURIComponent(externalId), 'DELETE');
             closeModal('extDetailModal');
             reload();
         } catch (e) { showToast(e.message, 'error'); }
     }
 
-    // PATCH/DELETE need to go through fetch since apiCall only handles POST. Override:
-    const _origApiCall = apiCall;
-    window.apiCall = async function (url, method = 'GET', body = null) {
-        const opts = { method, headers: { 'Content-Type': 'application/json' } };
-        if (body) opts.body = JSON.stringify(body);
-        const res = await fetch(url, opts);
-        if (res.status === 401 || res.status === 403) { window.location.href = '/login'; throw new Error('Session expired'); }
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Unknown error');
-        return data;
-    };
+    async function openAddConnModal() {
+        if (!currentExtId) return;
+        document.getElementById('addConnExtId').value = currentExtId;
+        document.getElementById('addConnLabel').value = '';
+        try {
+            if (!cachedServers) {
+                const resp = await apiCall('/api/admin/servers/list');
+                cachedServers = resp.servers || [];
+            }
+            const serverSel = document.getElementById('addConnServer');
+            serverSel.innerHTML = cachedServers.map(s =>
+                `<option value="${s.id}" data-protocols='${JSON.stringify(s.protocols)}'>${s.label}${s.region ? ' (' + s.region + ')' : ''}</option>`
+            ).join('');
+            updateProtocolOptions();
+            serverSel.onchange = updateProtocolOptions;
+            openModal('addConnModal');
+        } catch (e) {
+            showToast(e.message, 'error');
+        }
+    }
+
+    function updateProtocolOptions() {
+        const sel = document.getElementById('addConnServer');
+        const opt = sel.options[sel.selectedIndex];
+        if (!opt) return;
+        const protos = JSON.parse(opt.getAttribute('data-protocols') || '[]');
+        const pickable = protos.filter(p => p !== 'dns');
+        document.getElementById('addConnProtocol').innerHTML = pickable.map(p =>
+            `<option value="${p}">${p}</option>`
+        ).join('');
+    }
+
+    async function addConnection(e) {
+        e.preventDefault();
+        const externalId = document.getElementById('addConnExtId').value;
+        const body = {
+            server_id: document.getElementById('addConnServer').value,
+            protocol: document.getElementById('addConnProtocol').value,
+            label: document.getElementById('addConnLabel').value || null,
+        };
+        try {
+            const resp = await apiCall(
+                '/api/admin/external_users/' + encodeURIComponent(externalId) + '/connections',
+                'POST', body);
+            closeModal('addConnModal');
+            openDetail(externalId);
+            reload();
+            if (resp.vpn_link || resp.config) showConnConfigPayload(resp);
+        } catch (err) { showToast(err.message, 'error'); }
+        return false;
+    }
+
+    async function removeConnection(connId) {
+        if (!confirm(_('ext_delete_connection_confirm'))) return;
+        try {
+            await apiCall(
+                '/api/admin/external_users/' + encodeURIComponent(currentExtId) + '/connections/' + encodeURIComponent(connId),
+                'DELETE');
+            openDetail(currentExtId);
+            reload();
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function toggleConnection(connId, enable) {
+        try {
+            await apiCall(
+                '/api/admin/external_users/' + encodeURIComponent(currentExtId) + '/connections/' + encodeURIComponent(connId),
+                'PATCH', { enabled: enable });
+            openDetail(currentExtId);
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function showConnConfig(connId) {
+        try {
+            const resp = await apiCall(
+                '/api/admin/external_users/' + encodeURIComponent(currentExtId) + '/connections/' + encodeURIComponent(connId) + '/config');
+            showConnConfigPayload(resp);
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    function showConnConfigPayload(resp) {
+        const body = document.getElementById('connConfigBody');
+        const cfg = resp.config || '';
+        const link = resp.vpn_link || '';
+        const shareUrl = resp.share_url || '';
+        body.innerHTML = `
+            ${shareUrl ? `<div class="form-group"><label class="form-label">${_('share_link') || 'Share link'}</label><div style="display:flex; gap:var(--space-sm);"><input class="form-input" type="text" value="${shareUrl}" readonly id="shareUrlField"><button class="btn btn-secondary" onclick="copyToClipboard('${shareUrl}')">${_('copy') || 'Copy'}</button></div></div>` : ''}
+            ${link ? `<div class="form-group"><label class="form-label">vpn://</label><div style="display:flex; gap:var(--space-sm);"><input class="form-input" type="text" value="${link}" readonly><button class="btn btn-secondary" onclick="copyToClipboard(${JSON.stringify(link)})">${_('copy') || 'Copy'}</button></div></div>` : ''}
+            ${cfg ? `<div class="form-group"><label class="form-label">config</label><textarea class="form-input" readonly rows="10" style="font-family: monospace; font-size: 0.8rem;">${cfg}</textarea></div>` : ''}
+        `;
+        openModal('connConfigModal');
+    }
 
     reload();
 </script>

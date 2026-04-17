@@ -2804,6 +2804,225 @@ async def api_admin_delete_ext_user(request: Request, external_id: str):
     return {"status": "deleted"}
 
 
+class ExtConnectionAdminCreate(BaseModel):
+    server_id: str
+    protocol: str = "wireguard"
+    label: str | None = None
+
+
+class ExtConnectionAdminPatch(BaseModel):
+    enabled: bool | None = None
+    label: str | None = None
+    traffic_limit: int | None = None
+
+
+@app.get("/api/admin/servers/list")
+async def api_admin_servers_list(request: Request):
+    """Lightweight server list for the external-user connection picker."""
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    out = []
+    for srv in data.get("servers", []):
+        out.append(
+            {
+                "id": srv.get("id"),
+                "label": srv.get("name") or srv.get("host"),
+                "region": srv.get("region", ""),
+                "protocols": list((srv.get("protocols") or {}).keys()),
+                "reachable": srv.get("reachable", True),
+            }
+        )
+    return {"servers": out}
+
+
+@app.post("/api/admin/external_users/{external_id}/connections")
+async def api_admin_create_ext_conn(request: Request, external_id: str, payload: ExtConnectionAdminCreate):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    if not ext_api._ext_user_by_id(data, external_id):
+        return JSONResponse({"error": "External user not found"}, status_code=404)
+    selected = ext_api._select_server(data, payload.protocol, payload.server_id, None)
+    if not selected:
+        return JSONResponse({"error": f"No server matching protocol={payload.protocol}"}, status_code=503)
+    server_idx, server = selected
+    proto_info = server.get("protocols", {}).get(payload.protocol, {})
+    port = proto_info.get("port", "55424")
+    name = payload.label or f"{external_id}_{payload.protocol}"
+
+    def _provision():
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            return get_protocol_manager(ssh, payload.protocol).add_client(payload.protocol, name, server["host"], port)
+        finally:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+
+    try:
+        result = await asyncio.to_thread(_provision)
+    except Exception as e:
+        logger.exception("Provisioning failed")
+        return JSONResponse({"error": f"Provisioning failed: {e}"}, status_code=502)
+    if not result.get("client_id"):
+        return JSONResponse({"error": "Provisioning failed on remote server"}, status_code=502)
+
+    config_text = result.get("config")
+    new_conn_id = str(uuid.uuid4())
+    async with DATA_LOCK:
+        data = load_data()
+        user_record = ext_api._ensure_panel_user_for_external(data, external_id)
+        share_token = ext_api._ensure_share_token(user_record)
+        conn = {
+            "id": new_conn_id,
+            "user_id": user_record["id"],
+            "external_user_id": external_id,
+            "server_id": server_idx,
+            "protocol": payload.protocol,
+            "client_id": result["client_id"],
+            "name": name,
+            "enabled": True,
+            "traffic_limit": 0,
+            "last_bytes": 0,
+            "label": payload.label,
+            "created_at": ext_api._now_iso(),
+        }
+        data["user_connections"].append(conn)
+        await asyncio.to_thread(save_data, data)
+
+    response = ext_api._serialize_connection(conn, data)
+    response["config"] = config_text
+    response["vpn_link"] = generate_vpn_link(config_text) if config_text else None
+    response["share_url"] = str(request.base_url).rstrip("/") + f"/share/{share_token}"
+    return response
+
+
+@app.patch("/api/admin/external_users/{external_id}/connections/{conn_id}")
+async def api_admin_patch_ext_conn(request: Request, external_id: str, conn_id: str, payload: ExtConnectionAdminPatch):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    async with DATA_LOCK:
+        data = load_data()
+        conn = ext_api._conn_by_id(data, conn_id)
+        if not conn or conn.get("external_user_id") != external_id:
+            return JSONResponse({"error": "Connection not found"}, status_code=404)
+        if payload.label is not None:
+            conn["label"] = payload.label
+        if payload.traffic_limit is not None:
+            conn["traffic_limit"] = payload.traffic_limit
+        toggle_target = None
+        if payload.enabled is not None and payload.enabled != conn.get("enabled", True):
+            toggle_target = payload.enabled
+            conn["enabled"] = payload.enabled
+        await asyncio.to_thread(save_data, data)
+
+    if toggle_target is not None:
+        sid = conn.get("server_id")
+        if isinstance(sid, int) and 0 <= sid < len(data["servers"]):
+            server = data["servers"][sid]
+
+            def _toggle():
+                ssh = get_ssh(server)
+                ssh.connect()
+                try:
+                    get_protocol_manager(ssh, conn["protocol"]).toggle_client(
+                        conn["protocol"], conn["client_id"], toggle_target
+                    )
+                finally:
+                    try:
+                        ssh.disconnect()
+                    except Exception:
+                        pass
+
+            try:
+                await asyncio.to_thread(_toggle)
+            except Exception as e:
+                logger.warning("Toggle remote failed for %s: %s", conn_id, e)
+
+    return ext_api._serialize_connection(conn, data)
+
+
+@app.delete("/api/admin/external_users/{external_id}/connections/{conn_id}")
+async def api_admin_delete_ext_conn(request: Request, external_id: str, conn_id: str):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    conn = ext_api._conn_by_id(data, conn_id)
+    if not conn or conn.get("external_user_id") != external_id:
+        return JSONResponse({"error": "Connection not found"}, status_code=404)
+    sid = conn.get("server_id")
+    if isinstance(sid, int) and 0 <= sid < len(data["servers"]):
+        server = data["servers"][sid]
+
+        def _remove():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                get_protocol_manager(ssh, conn["protocol"]).remove_client(conn["protocol"], conn["client_id"])
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        try:
+            await asyncio.to_thread(_remove)
+        except Exception as e:
+            logger.warning("Remote revoke failed for %s: %s", conn_id, e)
+
+    async with DATA_LOCK:
+        data = load_data()
+        data["user_connections"] = [c for c in data["user_connections"] if c["id"] != conn_id]
+        await asyncio.to_thread(save_data, data)
+    return {"status": "deleted"}
+
+
+@app.get("/api/admin/external_users/{external_id}/connections/{conn_id}/config")
+async def api_admin_get_ext_conn_config(request: Request, external_id: str, conn_id: str):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    conn = ext_api._conn_by_id(data, conn_id)
+    if not conn or conn.get("external_user_id") != external_id:
+        return JSONResponse({"error": "Connection not found"}, status_code=404)
+    sid = conn.get("server_id")
+    if not (isinstance(sid, int) and 0 <= sid < len(data["servers"])):
+        return JSONResponse({"error": "Server missing for connection"}, status_code=404)
+    server = data["servers"][sid]
+    proto_info = server.get("protocols", {}).get(conn["protocol"], {})
+    port = proto_info.get("port", "55424")
+
+    def _get_config():
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            return get_protocol_manager(ssh, conn["protocol"]).get_client_config(
+                conn["protocol"], conn["client_id"], server["host"], port
+            )
+        finally:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+
+    try:
+        config = await asyncio.to_thread(_get_config)
+    except Exception as e:
+        logger.exception("get_client_config failed")
+        return JSONResponse({"error": str(e)}, status_code=502)
+    user_record = next((u for u in data.get("users", []) if u.get("ext_user_id") == external_id), None)
+    share_token = user_record.get("share_token") if user_record else None
+    share_url = (str(request.base_url).rstrip("/") + f"/share/{share_token}") if share_token else ""
+    return {
+        "config": config,
+        "vpn_link": generate_vpn_link(config) if config else "",
+        "share_url": share_url,
+    }
+
+
 @app.get("/api/admin/api_keys")
 async def api_admin_list_keys(request: Request):
     if not _check_admin(request):
