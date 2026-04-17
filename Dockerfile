@@ -14,9 +14,9 @@ COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
 
-# Trim wheel metadata and bundled test suites; keep __pycache__ (UV_COMPILE_BYTECODE=1).
-RUN find /app/.venv -name '*.dist-info' -type d -exec rm -rf {} + \
- && find /app/.venv/lib -type d -name 'tests' -prune -exec rm -rf {} + \
+# Trim bundled test suites; keep __pycache__ (UV_COMPILE_BYTECODE=1) and .dist-info
+# (paramiko and others read their version via importlib.metadata at import time).
+RUN find /app/.venv/lib -type d -name 'tests' -prune -exec rm -rf {} + \
  && find /app/.venv/lib -type d -name 'test' -prune -exec rm -rf {} +
 
 FROM python:3.12-slim-bookworm
