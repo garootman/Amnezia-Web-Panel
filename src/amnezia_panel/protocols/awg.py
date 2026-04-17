@@ -145,6 +145,7 @@ class AWGManager:
 
     def __init__(self, ssh_manager):
         self.ssh = ssh_manager
+        self._resolved_paths = {}
 
     def _container_name(self, protocol_type):
         """Get Docker container name for protocol type."""
@@ -154,12 +155,33 @@ class AWGManager:
             return "amnezia-awg2"
         return "amnezia-awg"
 
+    def _resolve_config(self, protocol_type):
+        """Return (config_path, interface_name) for the container.
+
+        AWG containers installed by this panel use awg0.conf/awg0, while
+        containers installed by the stock Amnezia client use wg0.conf/wg0.
+        Probe the container and cache the first match so both layouts work.
+        """
+        if protocol_type == self.AWG_LEGACY:
+            return "/opt/amnezia/awg/wg0.conf", "wg0"
+        if protocol_type in self._resolved_paths:
+            return self._resolved_paths[protocol_type]
+
+        container = self._container_name(protocol_type)
+        for path, iface in (
+            ("/opt/amnezia/awg/awg0.conf", "awg0"),
+            ("/opt/amnezia/awg/wg0.conf", "wg0"),
+        ):
+            _, _, code = self.ssh.run_sudo_command(f"docker exec -i {container} test -f {path}")
+            if code == 0:
+                self._resolved_paths[protocol_type] = (path, iface)
+                return path, iface
+        # No config yet (e.g. during install) — fall back to panel default.
+        return "/opt/amnezia/awg/awg0.conf", "awg0"
+
     def _config_path(self, protocol_type):
         """Get server config path inside container."""
-        if protocol_type == self.AWG_LEGACY:
-            return "/opt/amnezia/awg/wg0.conf"
-        # Both AWG and AWG2 use awg0.conf
-        return "/opt/amnezia/awg/awg0.conf"
+        return self._resolve_config(protocol_type)[0]
 
     def _wg_binary(self, protocol_type):
         """Get the wireguard binary name."""
@@ -176,11 +198,8 @@ class AWGManager:
         return "awg-quick"
 
     def _interface_name(self, protocol_type):
-        """Get the interface name."""
-        if protocol_type == self.AWG_LEGACY:
-            return "wg0"
-        # AWG and AWG2 both use 'awg0' interface
-        return "awg0"
+        """Get the interface name (matches config file basename)."""
+        return self._resolve_config(protocol_type)[1]
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""
