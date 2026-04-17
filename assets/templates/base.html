@@ -42,15 +42,9 @@
 
             {% if current_user %}
             <nav class="header-nav">
-                {% if current_user.role in ['admin', 'support'] %}
                 <a href="/" class="nav-link">{{ _('nav_servers') }}</a>
                 <a href="/users" class="nav-link">{{ _('nav_users') }}</a>
-                {% endif %}
-                {% if current_user.role == 'admin' %}
-                <a href="/external_users" class="nav-link">{{ _('nav_external_users') }}</a>
                 <a href="/settings" class="nav-link">{{ _('nav_settings') }}</a>
-                {% endif %}
-                <a href="/my" class="nav-link">{{ _('nav_connections') }}</a>
             </nav>
 
             <div class="nav-user">
@@ -62,11 +56,6 @@
                 <button class="theme-toggle" onclick="toggleTheme()" title="{{ _('toggle_theme') }}"
                     id="themeToggle">🌙</button>
                 <span class="nav-username">{{ current_user.username }}</span>
-                <span
-                    class="badge badge-{{ 'success' if current_user.role == 'admin' else ('info' if current_user.role == 'support' else 'warn') }}"
-                    style="font-size:0.65rem;">
-                    {{ current_user.role | upper }}
-                </span>
                 <a href="/logout" class="btn btn-secondary btn-sm">{{ _('nav_logout') }}</a>
             </div>
             {% else %}

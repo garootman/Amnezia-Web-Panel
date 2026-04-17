@@ -12,7 +12,7 @@ import secrets
 import tempfile
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, File, Query, Request, UploadFile
@@ -24,7 +24,6 @@ from pydantic import BaseModel, field_validator
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import ext_api, secrets_store
-from . import telegram_bot as tg_bot
 from .config import settings
 from .protocols.awg import AWGManager
 from .protocols.wireguard import WireGuardManager
@@ -112,7 +111,6 @@ def load_data():
     data.setdefault("servers", [])
     data.setdefault("users", [])
     data.setdefault("user_connections", [])
-    data.setdefault("external_users", [])
     data.setdefault("api_keys", [])
     data.setdefault(
         "settings",
@@ -412,10 +410,8 @@ async def sync_users_with_remnawave(data: dict):
                 data = load_data()
                 local_u = next((u for u in data["users"] if u.get("remnawave_uuid") == rw_u["uuid"]), None)
                 if not local_u:
-                    # Fall back to username match ONLY for users that were already Remnawave-imported
-                    # (empty password_hash). Never hijack a local admin account that shares a username.
                     local_u = next(
-                        (u for u in data["users"] if u["username"] == rw_u["username"] and not u.get("password_hash")),
+                        (u for u in data["users"] if u["username"] == rw_u["username"]),
                         None,
                     )
 
@@ -423,7 +419,6 @@ async def sync_users_with_remnawave(data: dict):
 
                 if local_u:
                     local_u["username"] = rw_u["username"]
-                    local_u["telegramId"] = rw_u.get("telegramId")
                     local_u["email"] = rw_u.get("email")
                     local_u["description"] = rw_u.get("description")
                     local_u["remnawave_uuid"] = rw_u["uuid"]
@@ -446,9 +441,6 @@ async def sync_users_with_remnawave(data: dict):
                     new_user = {
                         "id": new_id,
                         "username": rw_u["username"],
-                        "password_hash": "",
-                        "role": "user",
-                        "telegramId": rw_u.get("telegramId"),
                         "email": rw_u.get("email"),
                         "description": rw_u.get("description"),
                         "enabled": is_active,
@@ -495,9 +487,9 @@ def get_current_user(request: Request):
     if not user_id:
         return None
     data = load_data()
-    for u in data.get("users", []):
-        if u["id"] == user_id:
-            return u
+    admin = data.get("admin") or {}
+    if admin.get("id") == user_id:
+        return admin
     return None
 
 
@@ -509,8 +501,6 @@ def tpl(request, template, **kwargs):
         "current_user": get_current_user(request),
         "site_settings": data.get("settings", {}).get("appearance", {}),
         "captcha_settings": data.get("settings", {}).get("captcha", {}),
-        "telegram_settings": data.get("settings", {}).get("telegram", {}),
-        "bot_running": tg_bot.is_running(),
         "lang": lang,
         "_": lambda text_id: _t(text_id, lang),
         "translations_json": json.dumps(TRANSLATIONS.get(lang, TRANSLATIONS.get("en", {}))),
@@ -606,9 +596,6 @@ class ToggleConnectionRequest(BaseModel):
 
 class AddUserRequest(BaseModel):
     username: str
-    password: str
-    role: str = "user"
-    telegramId: str | None = None
     email: str | None = None
     description: str | None = None
     traffic_limit: float | None = 0
@@ -659,26 +646,18 @@ class SSLSettings(BaseModel):
     key_text: str = ""
 
 
-class TelegramSettings(BaseModel):
-    token: str = ""
-    enabled: bool = False
-
-
 class UpdateUserRequest(BaseModel):
-    telegramId: str | None = None
     email: str | None = None
     description: str | None = None
     traffic_limit: float | None = 0
     traffic_reset_strategy: str | None = None
     expiration_date: str | None = None
-    password: str | None = None
 
 
 class SaveSettingsRequest(BaseModel):
     appearance: AppearanceSettings
     sync: SyncSettings
     captcha: CaptchaSettings
-    telegram: TelegramSettings
     ssl: SSLSettings
 
 
@@ -714,8 +693,125 @@ class ShareAuthRequest(BaseModel):
 def _apply_schema_migrations(data: dict) -> bool:
     """Backfill fields on users/settings for older data.json schemas. Returns True if anything changed."""
     changed = False
+
+    # ── Admin split + external_users merge ───────────────────────────────────
+    # Legacy shape: data["users"] is a list where one entry has role in ("admin","support")
+    # and the rest are role:"user" customers. data["external_users"] is a parallel list.
+    # Target shape: data["admin"] is a single object; data["users"] is one unified list
+    # (former role:"user" + former external_users). No password/role on unified users.
+    legacy_users = data.get("users") or []
+    has_role_field = any("role" in u for u in legacy_users)
+    if "admin" not in data and has_role_field:
+        data["_legacy_users"] = list(legacy_users)
+
+        admin_entry = next((u for u in legacy_users if u.get("role") in ("admin", "support")), None)
+        if admin_entry:
+            data["admin"] = {
+                "id": admin_entry["id"],
+                "username": admin_entry["username"],
+                "password_hash": admin_entry.get("password_hash", ""),
+            }
+            extras = [
+                u["username"]
+                for u in legacy_users
+                if u.get("role") in ("admin", "support") and u["id"] != admin_entry["id"]
+            ]
+            if extras:
+                logger.warning(
+                    "MIGRATION: %d extra admin/support account(s) discarded: %s. Only %s retained as the single admin.",
+                    len(extras),
+                    extras,
+                    admin_entry["username"],
+                )
+        else:
+            logger.error(
+                "MIGRATION: no admin/support found in legacy users; seeding default admin/admin — change immediately."
+            )
+            data["admin"] = {
+                "id": str(uuid.uuid4()),
+                "username": "admin",
+                "password_hash": hash_password("admin"),
+            }
+
+        unified: list[dict] = []
+        seen_usernames: set[str] = set()
+        for u in legacy_users:
+            if u.get("role") == "user":
+                entry = {k: v for k, v in u.items() if k not in ("password_hash", "role", "telegramId")}
+                unified.append(entry)
+                if entry.get("username"):
+                    seen_usernames.add(entry["username"])
+
+        legacy_ext = data.get("external_users") or []
+        if legacy_ext:
+            data["_legacy_external_users"] = list(legacy_ext)
+            ext_id_to_new_uuid: dict[str, str] = {}
+            for eu in legacy_ext:
+                ext_id = eu.get("external_id", "")
+                if ext_id and ext_id in seen_usernames:
+                    logger.warning(
+                        "MIGRATION: external_user external_id=%s conflicts with existing username; skipping.",
+                        ext_id,
+                    )
+                    continue
+                entry = dict(eu)
+                entry.setdefault("id", str(uuid.uuid4()))
+                entry.setdefault("username", ext_id or entry["id"])
+                entry.setdefault("enabled", eu.get("status", "active") != "suspended")
+                entry.setdefault("share_enabled", True)
+                entry.setdefault("share_token", secrets.token_urlsafe(16))
+                entry.setdefault("share_password_hash", None)
+                unified.append(entry)
+                if entry.get("username"):
+                    seen_usernames.add(entry["username"])
+                if ext_id:
+                    ext_id_to_new_uuid[ext_id] = entry["id"]
+
+            # Rewrite connection FKs from external_user_id to user_id
+            rewritten = 0
+            orphans = 0
+            for conn in data.get("user_connections", []):
+                ext_id = conn.get("external_user_id")
+                if not ext_id:
+                    continue
+                new_uuid = ext_id_to_new_uuid.get(ext_id)
+                if new_uuid:
+                    conn["user_id"] = new_uuid
+                    rewritten += 1
+                else:
+                    orphans += 1
+                conn["external_user_id"] = None
+            if rewritten:
+                logger.info("MIGRATION: rewrote %d connection FKs to unified user_id.", rewritten)
+            if orphans:
+                logger.warning(
+                    "MIGRATION: %d connection(s) referenced unknown external_id and were left with null FK.",
+                    orphans,
+                )
+            data["external_users"] = []
+
+        data["users"] = unified
+        changed = True
+        logger.info(
+            "MIGRATION: converted legacy structure -> admin + %d unified users (%d panel, %d external).",
+            len(unified),
+            sum(1 for u in legacy_users if u.get("role") == "user"),
+            len(legacy_ext),
+        )
+
+    # Strip legacy external_users key if now empty and still present
+    if data.get("external_users") == []:
+        data.pop("external_users", None)
+        changed = True
+
     for u in data.get("users", []):
         migrated = False
+        # Strip any residual login-only fields (safe to run repeatedly)
+        for f in ("password_hash", "role", "telegramId"):
+            if f in u:
+                u.pop(f, None)
+                migrated = True
+        is_ext = bool(u.get("external_id"))
         if "share_enabled" not in u:
             u["share_enabled"] = False
             migrated = True
@@ -725,21 +821,21 @@ def _apply_schema_migrations(data: dict) -> bool:
         if "share_password_hash" not in u:
             u["share_password_hash"] = None
             migrated = True
-        if "traffic_reset_strategy" not in u:
-            u["traffic_reset_strategy"] = "never"
-            migrated = True
-        if "traffic_total" not in u:
-            u["traffic_total"] = u.get("traffic_used", 0)
-            migrated = True
-        if "last_reset_at" not in u:
-            u["last_reset_at"] = datetime.now().isoformat()
-            migrated = True
-        if "expiration_date" not in u:
-            u["expiration_date"] = None
-            migrated = True
+        if not is_ext:
+            if "traffic_reset_strategy" not in u:
+                u["traffic_reset_strategy"] = "never"
+                migrated = True
+            if "traffic_total" not in u:
+                u["traffic_total"] = u.get("traffic_used", 0)
+                migrated = True
+            if "last_reset_at" not in u:
+                u["last_reset_at"] = datetime.now().isoformat()
+                migrated = True
+            if "expiration_date" not in u:
+                u["expiration_date"] = None
+                migrated = True
         if migrated:
             changed = True
-            logger.info(f"Migrated user {u['username']} to new traffic/sharing fields")
 
     if "ssl" not in data.get("settings", {}):
         data.setdefault("settings", {})
@@ -759,10 +855,11 @@ def _apply_schema_migrations(data: dict) -> bool:
         changed = True
         logger.info("Removed legacy ssl.panel_port from data.json (use PANEL_PORT env instead)")
 
-    # External-API model: stable server UUIDs, region tags, external_users, api_keys, FK on connections.
-    if "external_users" not in data:
-        data["external_users"] = []
+    if "telegram" in data.get("settings", {}):
+        data["settings"].pop("telegram", None)
         changed = True
+        logger.info("MIGRATION: removed settings.telegram block.")
+
     if "api_keys" not in data:
         data["api_keys"] = []
         changed = True
@@ -773,9 +870,10 @@ def _apply_schema_migrations(data: dict) -> bool:
         if "region" not in srv:
             srv["region"] = ""
             changed = True
+    # Drop stale external_user_id from connections (replaced by user_id FK).
     for conn in data.get("user_connections", []):
-        if "external_user_id" not in conn:
-            conn["external_user_id"] = None
+        if "external_user_id" in conn:
+            conn.pop("external_user_id", None)
             changed = True
 
     return changed
@@ -788,21 +886,29 @@ async def startup():
     changed = needs_secrets_migration
     if needs_secrets_migration:
         logger.info("Encrypting credential fields in data.json at rest")
-    if not data.get("users"):
-        data["users"] = [
-            {
-                "id": str(uuid.uuid4()),
-                "username": "admin",
-                "password_hash": hash_password("admin"),
-                "role": "admin",
-                "enabled": True,
-                "created_at": datetime.now().isoformat(),
-            }
-        ]
-        changed = True
-        logger.info("Default admin created (admin / admin)")
 
     if _apply_schema_migrations(data):
+        changed = True
+
+    reset_pw = os.environ.get("ADMIN_PASSWORD_RESET")
+    if reset_pw and data.get("admin"):
+        data["admin"]["password_hash"] = hash_password(reset_pw)
+        changed = True
+        logger.warning(
+            "ADMIN_PASSWORD_RESET applied — admin password has been reset. "
+            "Unset ADMIN_PASSWORD_RESET and restart to clear this warning."
+        )
+
+    if not data.get("admin"):
+        data["admin"] = {
+            "id": str(uuid.uuid4()),
+            "username": "admin",
+            "password_hash": hash_password("admin"),
+        }
+        changed = True
+        logger.info("Default admin created (admin / admin)")
+    if "users" not in data:
+        data["users"] = []
         changed = True
 
     if changed:
@@ -813,12 +919,6 @@ async def startup():
 
     # External API webhook delivery consumer.
     ext_api.start_webhook_consumer(_BACKGROUND_TASKS)
-
-    # Start Telegram bot if enabled
-    tg_cfg = data.get("settings", {}).get("telegram", {})
-    if tg_cfg.get("enabled") and tg_cfg.get("token"):
-        logger.info("Starting Telegram bot from saved settings...")
-        tg_bot.launch_bot(tg_cfg["token"], load_data, generate_vpn_link)
 
 
 def _scrape_server_traffic(server, sid, my_conns):
@@ -966,18 +1066,19 @@ async def periodic_background_tasks():
                 logger.info(f"Traffic limit reached, disabling users: {to_disable_uids}")
                 await perform_mass_operations(toggle_uids=[(uid, False) for uid in to_disable_uids])
 
-                # Notify external API consumers about quota exhaustion. Group by external user
-                # so each portal-side user gets a single payload with all of its connections.
+                # Notify external API consumers about quota exhaustion. Only fires for
+                # ext-API-origin users (they have external_id set on the unified user record).
                 quota_data = load_data()
+                users_by_id = {u["id"]: u for u in quota_data.get("users", [])}
                 for uid in to_disable_uids:
-                    affected_conn_ids = []
-                    affected_ext_id = None
-                    for conn in quota_data.get("user_connections", []):
-                        if conn.get("user_id") == uid and conn.get("external_user_id"):
-                            affected_ext_id = conn["external_user_id"]
-                            affected_conn_ids.append(conn["id"])
-                    if affected_ext_id and affected_conn_ids:
-                        await ext_api.fire_quota_exhausted_event(affected_ext_id, affected_conn_ids)
+                    user = users_by_id.get(uid)
+                    if not user or not user.get("external_id"):
+                        continue
+                    affected_conn_ids = [
+                        c["id"] for c in quota_data.get("user_connections", []) if c.get("user_id") == uid
+                    ]
+                    if affected_conn_ids:
+                        await ext_api.fire_quota_exhausted_event(user["external_id"], affected_conn_ids)
 
             # --- 2. EXTERNAL-USER EXPIRY SWEEPER ---
             try:
@@ -1030,22 +1131,16 @@ async def logout(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    user = get_current_user(request)
-    if not user:
+    if not get_current_user(request):
         return RedirectResponse(url="/login", status_code=302)
-    if user["role"] == "user":
-        return RedirectResponse(url="/my", status_code=302)
     data = load_data()
     return tpl(request, "index.html", servers=data["servers"])
 
 
 @app.get("/server/{server_id}", response_class=HTMLResponse)
 async def server_detail(request: Request, server_id: int):
-    user = get_current_user(request)
-    if not user:
+    if not get_current_user(request):
         return RedirectResponse(url="/login", status_code=302)
-    if user["role"] not in ("admin", "support"):
-        return RedirectResponse(url="/my", status_code=302)
     data = load_data()
     if server_id >= len(data["servers"]):
         return RedirectResponse(url="/")
@@ -1056,11 +1151,8 @@ async def server_detail(request: Request, server_id: int):
 
 @app.get("/users", response_class=HTMLResponse)
 async def users_page(request: Request):
-    user = get_current_user(request)
-    if not user:
+    if not get_current_user(request):
         return RedirectResponse(url="/login", status_code=302)
-    if user["role"] not in ("admin", "support"):
-        return RedirectResponse(url="/my", status_code=302)
     data = load_data()
     users_list = data.get("users", [])
     # Count connections per user
@@ -1069,23 +1161,6 @@ async def users_page(request: Request):
         u["connections_count"] = sum(1 for c in conns if c["user_id"] == u["id"])
     servers = data["servers"]
     return tpl(request, "users.html", users=users_list, servers=servers)
-
-
-@app.get("/my", response_class=HTMLResponse)
-async def my_connections_page(request: Request):
-    user = get_current_user(request)
-    if not user:
-        return RedirectResponse(url="/login", status_code=302)
-    data = load_data()
-    conns = [c for c in data.get("user_connections", []) if c["user_id"] == user["id"]]
-    # Enrich with server names
-    for c in conns:
-        sid = c.get("server_id", 0)
-        if sid < len(data["servers"]):
-            c["server_name"] = data["servers"][sid].get("name", data["servers"][sid].get("host", ""))
-        else:
-            c["server_name"] = "Unknown"
-    return tpl(request, "my_connections.html", connections=conns)
 
 
 # ======================== AUTH API ========================
@@ -1156,14 +1231,11 @@ async def api_login(request: Request, req: LoginRequest):
             return JSONResponse({"error": _t("invalid_captcha", lang)}, status_code=400)
         request.session.pop("captcha_answer", None)
 
-    for u in data.get("users", []):
-        if u["username"] == req.username and verify_password(req.password, u["password_hash"]):
-            lang = request.cookies.get("lang", "ru")
-            if not u.get("enabled", True):
-                return JSONResponse({"error": _t("account_disabled", lang)}, status_code=403)
-            request.session["user_id"] = u["id"]
-            _clear_login_failures(ip)
-            return {"status": "success", "role": u["role"]}
+    admin = data.get("admin") or {}
+    if admin.get("username") == req.username and verify_password(req.password, admin.get("password_hash", "")):
+        request.session["user_id"] = admin["id"]
+        _clear_login_failures(ip)
+        return {"status": "success", "role": "admin"}
     lang = request.cookies.get("lang", "ru")
     _record_login_failure(ip)
     return JSONResponse({"error": _t("invalid_login", lang)}, status_code=401)
@@ -1173,10 +1245,7 @@ async def api_login(request: Request, req: LoginRequest):
 
 
 def _check_admin(request):
-    user = get_current_user(request)
-    if not user or user["role"] not in ("admin", "support"):
-        return None
-    return user
+    return get_current_user(request)
 
 
 @app.post("/api/servers/add")
@@ -1842,24 +1911,12 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
 
 @app.post("/api/servers/{server_id}/connections/config")
 async def api_get_connection_config(request: Request, server_id: int, req: ConnectionActionRequest):
-    user = get_current_user(request)
-    if not user:
+    if not _check_admin(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     try:
         data = load_data()
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
-        # Users can only view their own connections
-        if user["role"] == "user":
-            owned = any(
-                c
-                for c in data.get("user_connections", [])
-                if c.get("client_id") == req.client_id
-                and c.get("server_id") == server_id
-                and c.get("user_id") == user["id"]
-            )
-            if not owned:
-                return JSONResponse({"error": "Forbidden"}, status_code=403)
         server = data["servers"][server_id]
         if not req.client_id:
             return JSONResponse({"error": "Client ID is required"}, status_code=400)
@@ -1934,11 +1991,7 @@ async def api_list_users(request: Request, search: str = "", page: int = 1, size
     search = search.lower()
     for u in all_users:
         if search:
-            match = (
-                search in u["username"].lower()
-                or (u.get("email") and search in u["email"].lower())
-                or (u.get("telegramId") and search in str(u["telegramId"]).lower())
-            )
+            match = search in u["username"].lower() or (u.get("email") and search in u["email"].lower())
             if not match:
                 continue
         filtered.append(u)
@@ -1950,14 +2003,18 @@ async def api_list_users(request: Request, search: str = "", page: int = 1, size
 
     users = []
     for u in page_items:
+        if u.get("remnawave_uuid"):
+            source = "Remnawave"
+        elif u.get("external_id"):
+            source = "External API"
+        else:
+            source = "Local"
         users.append(
             {
                 "id": u["id"],
                 "username": u["username"],
-                "role": u["role"],
                 "enabled": u.get("enabled", True),
                 "created_at": u.get("created_at", ""),
-                "telegramId": u.get("telegramId"),
                 "email": u.get("email"),
                 "description": u.get("description"),
                 "connections_count": sum(1 for c in conns if c["user_id"] == u["id"]),
@@ -1969,7 +2026,11 @@ async def api_list_users(request: Request, search: str = "", page: int = 1, size
                 "share_enabled": u.get("share_enabled", False),
                 "share_token": u.get("share_token"),
                 "has_share_password": bool(u.get("share_password_hash")),
-                "source": "Remnawave" if u.get("remnawave_uuid") else "Local",
+                "external_id": u.get("external_id"),
+                "label": u.get("label"),
+                "expires_at": u.get("expires_at"),
+                "status": u.get("status"),
+                "source": source,
             }
         )
     return {"users": users, "total": total, "page": page, "size": size, "pages": (total + size - 1) // size}
@@ -1977,8 +2038,7 @@ async def api_list_users(request: Request, search: str = "", page: int = 1, size
 
 @app.post("/api/users/add")
 async def api_add_user(request: Request, req: AddUserRequest):
-    cur = get_current_user(request)
-    if not cur or cur["role"] != "admin":
+    if not _check_admin(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     try:
         data = load_data()
@@ -1986,14 +2046,9 @@ async def api_add_user(request: Request, req: AddUserRequest):
         # Check duplicate
         if any(u["username"] == req.username for u in data.get("users", [])):
             return JSONResponse({"error": _t("user_exists", lang)}, status_code=400)
-        if req.role not in ("admin", "support", "user"):
-            return JSONResponse({"error": "Invalid role"}, status_code=400)
         new_user = {
             "id": str(uuid.uuid4()),
             "username": req.username,
-            "password_hash": hash_password(req.password),
-            "role": req.role,
-            "telegramId": req.telegramId,
             "email": req.email,
             "description": req.description,
             "traffic_limit": int(req.traffic_limit * 1024**3) if req.traffic_limit else 0,
@@ -2082,8 +2137,6 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if not user:
             return JSONResponse({"error": "User not found"}, status_code=404)
 
-        if req.telegramId is not None:
-            user["telegramId"] = req.telegramId
         if req.email is not None:
             user["email"] = req.email
         if req.description is not None:
@@ -2098,9 +2151,6 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
 
         if req.expiration_date is not None:
             user["expiration_date"] = req.expiration_date or None
-
-        if req.password:
-            user["password_hash"] = hash_password(req.password)
 
         await save_data_async(data)
 
@@ -2118,12 +2168,8 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
 
 @app.post("/api/users/{user_id}/delete")
 async def api_delete_user(request: Request, user_id: str):
-    cur = get_current_user(request)
-    if not cur or cur["role"] != "admin":
+    if not _check_admin(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
-    lang = request.cookies.get("lang", "ru")
-    if cur["id"] == user_id:
-        return JSONResponse({"error": _t("cannot_delete_self", lang)}, status_code=400)
     try:
         data = load_data()
         success = await perform_delete_user(data, user_id)
@@ -2138,8 +2184,7 @@ async def api_delete_user(request: Request, user_id: str):
 
 @app.post("/api/users/{user_id}/toggle")
 async def api_toggle_user(request: Request, user_id: str, req: ToggleUserRequest):
-    cur = get_current_user(request)
-    if not cur or cur["role"] != "admin":
+    if not _check_admin(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     try:
         data = load_data()
@@ -2226,11 +2271,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
 
 @app.get("/api/users/{user_id}/connections")
 async def api_get_user_connections(request: Request, user_id: str):
-    user = get_current_user(request)
-    if not user:
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    # Users can only see their own, admin/support can see all
-    if user["role"] == "user" and user["id"] != user_id:
+    if not _check_admin(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     data = load_data()
     conns = [c for c in data.get("user_connections", []) if c["user_id"] == user_id]
@@ -2238,25 +2279,6 @@ async def api_get_user_connections(request: Request, user_id: str):
         sid = c.get("server_id", 0)
         if sid < len(data["servers"]):
             c["server_name"] = data["servers"][sid].get("name", "")
-    return {"connections": conns}
-
-
-# ======================== MY CONNECTIONS API (for user role) ========================
-
-
-@app.get("/api/my/connections")
-async def api_my_connections(request: Request):
-    user = get_current_user(request)
-    if not user:
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    conns = [c for c in data.get("user_connections", []) if c["user_id"] == user["id"]]
-    for c in conns:
-        sid = c.get("server_id", 0)
-        if sid < len(data["servers"]):
-            c["server_name"] = data["servers"][sid].get("name", "")
-        else:
-            c["server_name"] = "Unknown"
     return {"connections": conns}
 
 
@@ -2378,47 +2400,6 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.post("/api/my/connections/{connection_id}/config")
-async def api_my_connection_config(request: Request, connection_id: str):
-    user = get_current_user(request)
-    if not user:
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    try:
-        data = load_data()
-        conn = next(
-            (c for c in data.get("user_connections", []) if c["id"] == connection_id and c["user_id"] == user["id"]),
-            None,
-        )
-        if not conn:
-            return JSONResponse({"error": "Connection not found"}, status_code=404)
-        sid = conn["server_id"]
-        if sid >= len(data["servers"]):
-            return JSONResponse({"error": "Server not found"}, status_code=404)
-        server = data["servers"][sid]
-        proto_info = server.get("protocols", {}).get(conn["protocol"], {})
-        port = proto_info.get("port", "55424")
-
-        def _get_config():
-            ssh = get_ssh(server)
-            ssh.connect()
-            try:
-                return get_protocol_manager(ssh, conn["protocol"]).get_client_config(
-                    conn["protocol"], conn["client_id"], server["host"], port
-                )
-            finally:
-                try:
-                    ssh.disconnect()
-                except Exception:
-                    pass
-
-        config = await asyncio.to_thread(_get_config)
-        vpn_link = generate_vpn_link(config) if config else ""
-        return {"config": config, "vpn_link": vpn_link}
-    except Exception as e:
-        logger.exception("Error getting my connection config")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
 _VERSION_CACHE: dict | None = None
 _VERSION_CACHE_AT: float = 0.0
 _VERSION_CACHE_TTL = 3600.0
@@ -2501,50 +2482,10 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     data["settings"]["appearance"] = payload.appearance.dict()
     data["settings"]["sync"] = payload.sync.dict()
     data["settings"]["captcha"] = payload.captcha.dict()
-    data["settings"]["telegram"] = payload.telegram.dict()
     data["settings"]["ssl"] = payload.ssl.dict()
     await save_data_async(data)
-    logger.info("Settings saved (including captcha and telegram)")
-
-    # Handle bot start/stop based on new telegram settings
-    tg_cfg = payload.telegram
-    if tg_cfg.enabled and tg_cfg.token:
-        if not tg_bot.is_running():
-            logger.info("Starting Telegram bot (settings save)...")
-            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link)
-    else:
-        if tg_bot.is_running():
-            logger.info("Stopping Telegram bot (settings save)...")
-            task = asyncio.create_task(tg_bot.stop_bot())
-            _BACKGROUND_TASKS.add(task)
-            task.add_done_callback(_BACKGROUND_TASKS.discard)
-
-    return {"status": "success", "bot_running": tg_bot.is_running()}
-
-
-@app.post("/api/settings/telegram/toggle")
-async def api_telegram_toggle(request: Request):
-    """Quick enable/disable of the bot without a full settings save."""
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    tg_cfg = data.get("settings", {}).get("telegram", {})
-    token = tg_cfg.get("token", "")
-    if not token:
-        return JSONResponse({"error": "Telegram token not set in settings"}, status_code=400)
-
-    if tg_bot.is_running():
-        await tg_bot.stop_bot()
-        tg_cfg["enabled"] = False
-        data["settings"]["telegram"] = tg_cfg
-        await save_data_async(data)
-        return {"status": "stopped", "bot_running": False}
-    else:
-        tg_bot.launch_bot(token, load_data, generate_vpn_link)
-        tg_cfg["enabled"] = True
-        data["settings"]["telegram"] = tg_cfg
-        await save_data_async(data)
-        return {"status": "started", "bot_running": True}
+    logger.info("Settings saved")
+    return {"status": "success"}
 
 
 @app.post("/api/settings/sync_now")
@@ -2631,15 +2572,16 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
         except json.JSONDecodeError:
             return JSONResponse({"error": "Invalid JSON format"}, status_code=400)
 
-        # Basic structure validation
-        required_keys = ["servers", "users"]
-        missing = [k for k in required_keys if k not in backup_data]
-        if missing:
-            return JSONResponse({"error": f"Invalid structure. Missing keys: {', '.join(missing)}"}, status_code=400)
-
-        # Ensure types are correct
-        if not isinstance(backup_data["servers"], list) or not isinstance(backup_data["users"], list):
-            return JSONResponse({"error": "Invalid structure: servers and users must be lists"}, status_code=400)
+        # Basic structure validation — accept legacy shape (users list holds admin too)
+        # and new shape (separate admin object + users list); migration normalizes both.
+        if "servers" not in backup_data:
+            return JSONResponse({"error": "Invalid structure. Missing key: servers"}, status_code=400)
+        if "users" not in backup_data and "admin" not in backup_data:
+            return JSONResponse({"error": "Invalid structure. Missing key: users or admin"}, status_code=400)
+        if not isinstance(backup_data["servers"], list):
+            return JSONResponse({"error": "Invalid structure: servers must be a list"}, status_code=400)
+        if "users" in backup_data and not isinstance(backup_data["users"], list):
+            return JSONResponse({"error": "Invalid structure: users must be a list"}, status_code=400)
 
         _apply_schema_migrations(backup_data)
 
@@ -2652,31 +2594,11 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/external_users", response_class=HTMLResponse)
-async def external_users_page(request: Request):
-    user = get_current_user(request)
-    if not user or user["role"] != "admin":
-        return RedirectResponse(url="/login", status_code=302)
-    return tpl(request, "external_users.html")
-
-
-# ======================== ADMIN UI: External users + API keys ========================
+# ======================== ADMIN UI: API keys + lightweight helpers ========================
 #
-# Session-authenticated companions to /api/v1/ext. Used by the Users tab and the
-# Settings → API Keys section so an operator can manage portal-driven users
-# without needing HMAC-signed calls.
-
-
-class ExtUserAdminCreate(BaseModel):
-    external_id: str
-    expires_at: str
-    label: str | None = None
-
-
-class ExtUserAdminPatch(BaseModel):
-    expires_at: str | None = None
-    label: str | None = None
-    status: str | None = None
+# Session-authenticated helpers used by the unified users page and the
+# Settings → API Keys section so an operator can manage integrations without
+# HMAC-signed calls.
 
 
 class ApiKeyMintRequest(BaseModel):
@@ -2687,133 +2609,6 @@ class ApiKeyWebhookRequest(BaseModel):
     url: str = ""
     secret: str | None = None
     events: list[str] = []
-
-
-@app.get("/api/admin/external_users")
-async def api_admin_list_ext_users(
-    request: Request,
-    search: str = "",
-    status: str = "",
-    page: int = 1,
-    size: int = 25,
-):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    users = data.get("external_users", [])
-    if status:
-        users = [u for u in users if u.get("status") == status]
-    if search:
-        s = search.lower()
-        users = [u for u in users if s in u["external_id"].lower() or (u.get("label") and s in u["label"].lower())]
-    total = len(users)
-    size = max(1, min(size, 200))
-    page = max(1, page)
-    start = (page - 1) * size
-    page_items = users[start : start + size]
-    conns = data.get("user_connections", [])
-    rows = [ext_api._serialize_user(u, conns) for u in page_items]
-    return {"users": rows, "total": total, "page": page, "size": size, "pages": (total + size - 1) // size}
-
-
-@app.post("/api/admin/external_users")
-async def api_admin_create_ext_user(request: Request, payload: ExtUserAdminCreate):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    if ext_api._ext_user_by_id(data, payload.external_id):
-        return JSONResponse({"error": "External user already exists"}, status_code=400)
-    try:
-        ext_api._parse_iso(payload.expires_at)
-    except ValueError:
-        return JSONResponse({"error": "expires_at must be ISO 8601"}, status_code=400)
-    now = ext_api._now_iso()
-    record = {
-        "external_id": payload.external_id,
-        "label": payload.label,
-        "expires_at": payload.expires_at,
-        "status": "active",
-        "created_at": now,
-        "updated_at": now,
-        "expiring_soon_notified_at": None,
-    }
-    data["external_users"].append(record)
-    await save_data_async(data)
-    return {"status": "success", "user": ext_api._serialize_user(record, data.get("user_connections", []))}
-
-
-@app.get("/api/admin/external_users/{external_id}")
-async def api_admin_get_ext_user(request: Request, external_id: str):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    user = ext_api._ext_user_by_id(data, external_id)
-    if not user:
-        return JSONResponse({"error": "User not found"}, status_code=404)
-    summary = ext_api._serialize_user(user, data.get("user_connections", []))
-    summary["connections"] = [
-        ext_api._serialize_connection(c, data)
-        for c in data.get("user_connections", [])
-        if c.get("external_user_id") == external_id
-    ]
-    return summary
-
-
-@app.patch("/api/admin/external_users/{external_id}")
-async def api_admin_patch_ext_user(request: Request, external_id: str, payload: ExtUserAdminPatch):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    async with DATA_LOCK:
-        data = load_data()
-        user = ext_api._ext_user_by_id(data, external_id)
-        if not user:
-            return JSONResponse({"error": "User not found"}, status_code=404)
-        prev_status = user.get("status")
-        if payload.label is not None:
-            user["label"] = payload.label
-        if payload.expires_at is not None:
-            try:
-                ext_api._parse_iso(payload.expires_at)
-            except ValueError:
-                return JSONResponse({"error": "expires_at must be ISO 8601"}, status_code=400)
-            user["expires_at"] = payload.expires_at
-
-            if prev_status == "expired" and ext_api._parse_iso(payload.expires_at) > datetime.now(UTC):
-                user["status"] = "active"
-                user["expiring_soon_notified_at"] = None
-                await ext_api._re_enable_connections(data, external_id)
-        if payload.status is not None:
-            if payload.status not in ("active", "expired", "suspended"):
-                return JSONResponse({"error": "Invalid status"}, status_code=400)
-            user["status"] = payload.status
-            if payload.status == "suspended" and prev_status != "suspended":
-                await ext_api._disable_connections(data, external_id)
-        user["updated_at"] = ext_api._now_iso()
-        await asyncio.to_thread(save_data, data)
-    return {"status": "success", "user": ext_api._serialize_user(user, data.get("user_connections", []))}
-
-
-@app.delete("/api/admin/external_users/{external_id}")
-async def api_admin_delete_ext_user(request: Request, external_id: str):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    if not ext_api._ext_user_by_id(data, external_id):
-        return JSONResponse({"error": "User not found"}, status_code=404)
-    await ext_api._cascade_delete_user(external_id)
-    return {"status": "deleted"}
-
-
-class ExtConnectionAdminCreate(BaseModel):
-    server_id: str
-    protocol: str = "wireguard"
-    label: str | None = None
-
-
-class ExtConnectionAdminPatch(BaseModel):
-    enabled: bool | None = None
-    label: str | None = None
-    traffic_limit: int | None = None
 
 
 @app.get("/api/admin/servers/list")
@@ -2834,193 +2629,6 @@ async def api_admin_servers_list(request: Request):
             }
         )
     return {"servers": out}
-
-
-@app.post("/api/admin/external_users/{external_id}/connections")
-async def api_admin_create_ext_conn(request: Request, external_id: str, payload: ExtConnectionAdminCreate):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    if not ext_api._ext_user_by_id(data, external_id):
-        return JSONResponse({"error": "External user not found"}, status_code=404)
-    selected = ext_api._select_server(data, payload.protocol, payload.server_id, None)
-    if not selected:
-        return JSONResponse({"error": f"No server matching protocol={payload.protocol}"}, status_code=503)
-    server_idx, server = selected
-    proto_info = server.get("protocols", {}).get(payload.protocol, {})
-    port = proto_info.get("port", "55424")
-    name = payload.label or f"{external_id}_{payload.protocol}"
-
-    def _provision():
-        ssh = get_ssh(server)
-        ssh.connect()
-        try:
-            return get_protocol_manager(ssh, payload.protocol).add_client(payload.protocol, name, server["host"], port)
-        finally:
-            try:
-                ssh.disconnect()
-            except Exception:
-                pass
-
-    try:
-        result = await asyncio.to_thread(_provision)
-    except Exception as e:
-        logger.exception("Provisioning failed")
-        return JSONResponse({"error": f"Provisioning failed: {e}"}, status_code=502)
-    if not result.get("client_id"):
-        return JSONResponse({"error": "Provisioning failed on remote server"}, status_code=502)
-
-    config_text = result.get("config")
-    new_conn_id = str(uuid.uuid4())
-    async with DATA_LOCK:
-        data = load_data()
-        user_record = ext_api._ensure_panel_user_for_external(data, external_id)
-        share_token = ext_api._ensure_share_token(user_record)
-        conn = {
-            "id": new_conn_id,
-            "user_id": user_record["id"],
-            "external_user_id": external_id,
-            "server_id": server_idx,
-            "protocol": payload.protocol,
-            "client_id": result["client_id"],
-            "name": name,
-            "enabled": True,
-            "traffic_limit": 0,
-            "last_bytes": 0,
-            "label": payload.label,
-            "created_at": ext_api._now_iso(),
-        }
-        data["user_connections"].append(conn)
-        await asyncio.to_thread(save_data, data)
-
-    response = ext_api._serialize_connection(conn, data)
-    response["config"] = config_text
-    response["vpn_link"] = generate_vpn_link(config_text) if config_text else None
-    response["share_url"] = str(request.base_url).rstrip("/") + f"/share/{share_token}"
-    return response
-
-
-@app.patch("/api/admin/external_users/{external_id}/connections/{conn_id}")
-async def api_admin_patch_ext_conn(request: Request, external_id: str, conn_id: str, payload: ExtConnectionAdminPatch):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    async with DATA_LOCK:
-        data = load_data()
-        conn = ext_api._conn_by_id(data, conn_id)
-        if not conn or conn.get("external_user_id") != external_id:
-            return JSONResponse({"error": "Connection not found"}, status_code=404)
-        if payload.label is not None:
-            conn["label"] = payload.label
-        if payload.traffic_limit is not None:
-            conn["traffic_limit"] = payload.traffic_limit
-        toggle_target = None
-        if payload.enabled is not None and payload.enabled != conn.get("enabled", True):
-            toggle_target = payload.enabled
-            conn["enabled"] = payload.enabled
-        await asyncio.to_thread(save_data, data)
-
-    if toggle_target is not None:
-        sid = conn.get("server_id")
-        if isinstance(sid, int) and 0 <= sid < len(data["servers"]):
-            server = data["servers"][sid]
-
-            def _toggle():
-                ssh = get_ssh(server)
-                ssh.connect()
-                try:
-                    get_protocol_manager(ssh, conn["protocol"]).toggle_client(
-                        conn["protocol"], conn["client_id"], toggle_target
-                    )
-                finally:
-                    try:
-                        ssh.disconnect()
-                    except Exception:
-                        pass
-
-            try:
-                await asyncio.to_thread(_toggle)
-            except Exception as e:
-                logger.warning("Toggle remote failed for %s: %s", conn_id, e)
-
-    return ext_api._serialize_connection(conn, data)
-
-
-@app.delete("/api/admin/external_users/{external_id}/connections/{conn_id}")
-async def api_admin_delete_ext_conn(request: Request, external_id: str, conn_id: str):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    conn = ext_api._conn_by_id(data, conn_id)
-    if not conn or conn.get("external_user_id") != external_id:
-        return JSONResponse({"error": "Connection not found"}, status_code=404)
-    sid = conn.get("server_id")
-    if isinstance(sid, int) and 0 <= sid < len(data["servers"]):
-        server = data["servers"][sid]
-
-        def _remove():
-            ssh = get_ssh(server)
-            ssh.connect()
-            try:
-                get_protocol_manager(ssh, conn["protocol"]).remove_client(conn["protocol"], conn["client_id"])
-            finally:
-                try:
-                    ssh.disconnect()
-                except Exception:
-                    pass
-
-        try:
-            await asyncio.to_thread(_remove)
-        except Exception as e:
-            logger.warning("Remote revoke failed for %s: %s", conn_id, e)
-
-    async with DATA_LOCK:
-        data = load_data()
-        data["user_connections"] = [c for c in data["user_connections"] if c["id"] != conn_id]
-        await asyncio.to_thread(save_data, data)
-    return {"status": "deleted"}
-
-
-@app.get("/api/admin/external_users/{external_id}/connections/{conn_id}/config")
-async def api_admin_get_ext_conn_config(request: Request, external_id: str, conn_id: str):
-    if not _check_admin(request):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-    data = load_data()
-    conn = ext_api._conn_by_id(data, conn_id)
-    if not conn or conn.get("external_user_id") != external_id:
-        return JSONResponse({"error": "Connection not found"}, status_code=404)
-    sid = conn.get("server_id")
-    if not (isinstance(sid, int) and 0 <= sid < len(data["servers"])):
-        return JSONResponse({"error": "Server missing for connection"}, status_code=404)
-    server = data["servers"][sid]
-    proto_info = server.get("protocols", {}).get(conn["protocol"], {})
-    port = proto_info.get("port", "55424")
-
-    def _get_config():
-        ssh = get_ssh(server)
-        ssh.connect()
-        try:
-            return get_protocol_manager(ssh, conn["protocol"]).get_client_config(
-                conn["protocol"], conn["client_id"], server["host"], port
-            )
-        finally:
-            try:
-                ssh.disconnect()
-            except Exception:
-                pass
-
-    try:
-        config = await asyncio.to_thread(_get_config)
-    except Exception as e:
-        logger.exception("get_client_config failed")
-        return JSONResponse({"error": str(e)}, status_code=502)
-    user_record = next((u for u in data.get("users", []) if u.get("ext_user_id") == external_id), None)
-    share_token = user_record.get("share_token") if user_record else None
-    share_url = (str(request.base_url).rstrip("/") + f"/share/{share_token}") if share_token else ""
-    return {
-        "config": config,
-        "vpn_link": generate_vpn_link(config) if config else "",
-        "share_url": share_url,
-    }
 
 
 @app.get("/api/admin/api_keys")
@@ -3124,7 +2732,7 @@ async def api_admin_stats_summary(request: Request):
     if not _check_admin(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     data = load_data()
-    users = data.get("external_users", [])
+    users = data.get("users", [])
     conns = data.get("user_connections", [])
     from collections import defaultdict as _dd
 
@@ -3145,7 +2753,7 @@ async def api_admin_stats_summary(request: Request):
             }
         )
     return {
-        "active_users": sum(1 for u in users if u.get("status") == "active"),
+        "active_users": sum(1 for u in users if u.get("enabled", True)),
         "total_users": len(users),
         "total_connections": len(conns),
         "per_server": per_server,

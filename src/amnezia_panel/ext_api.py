@@ -293,8 +293,9 @@ def _server_by_uuid(data: dict, server_uuid: str) -> tuple[int, dict] | None:
 
 
 def _ext_user_by_id(data: dict, external_id: str) -> dict | None:
-    for u in data.get("external_users", []):
-        if u["external_id"] == external_id:
+    """Return the unified-users entry for an ext-API-origin user, or None."""
+    for u in data.get("users", []):
+        if u.get("external_id") == external_id:
             return u
     return None
 
@@ -306,13 +307,27 @@ def _conn_by_id(data: dict, conn_id: str) -> dict | None:
     return None
 
 
-def _serialize_user(u: dict, conns: list[dict]) -> dict:
-    user_conns = [c for c in conns if c.get("external_user_id") == u["external_id"]]
+def _user_conns(data: dict, user_record: dict) -> list[dict]:
+    uid = user_record.get("id")
+    return [c for c in data.get("user_connections", []) if c.get("user_id") == uid]
+
+
+def _serialize_user(u: dict, data_or_conns) -> dict:
+    """Serialize an ext-API user for external-API responses.
+
+    Accepts either the full ``data`` dict or the bare connections list so both call
+    patterns from before the unified-users migration keep working.
+    """
+    if isinstance(data_or_conns, dict):
+        user_conns = _user_conns(data_or_conns, u)
+    else:
+        uid = u.get("id")
+        user_conns = [c for c in data_or_conns if c.get("user_id") == uid]
     return {
-        "external_id": u["external_id"],
+        "external_id": u.get("external_id"),
         "label": u.get("label"),
-        "expires_at": u["expires_at"],
-        "status": u["status"],
+        "expires_at": u.get("expires_at"),
+        "status": u.get("status", "active"),
         "created_at": u.get("created_at"),
         "updated_at": u.get("updated_at"),
         "connections_count": len(user_conns),
@@ -338,9 +353,10 @@ def _serialize_connection(c: dict, data: dict) -> dict:
             server_uuid = srv["id"]
             server_label = srv.get("name") or srv.get("host")
             region = srv.get("region", "")
+    owner = next((u for u in data.get("users", []) if u.get("id") == c.get("user_id")), None)
     return {
         "id": c["id"],
-        "external_user_id": c.get("external_user_id"),
+        "external_user_id": owner.get("external_id") if owner else None,
         "server_id": server_uuid,
         "server_label": server_label,
         "region": region,
@@ -441,22 +457,29 @@ async def create_or_upsert_user(
             if existing.get("status") == "expired" and _parse_iso(payload.expires_at) > datetime.now(UTC):
                 existing["status"] = "active"
                 existing["expiring_soon_notified_at"] = None
+                existing["enabled"] = True
                 await _re_enable_connections(data, payload.external_id)
             user_record = existing
         else:
             user_record = {
+                "id": str(uuid.uuid4()),
                 "external_id": payload.external_id,
+                "username": payload.external_id,
                 "label": payload.label,
                 "expires_at": payload.expires_at,
                 "status": "active",
+                "enabled": True,
                 "created_at": now,
                 "updated_at": now,
                 "expiring_soon_notified_at": None,
+                "share_enabled": True,
+                "share_token": secrets.token_urlsafe(16),
+                "share_password_hash": None,
             }
-            data["external_users"].append(user_record)
+            data["users"].append(user_record)
         await asyncio.to_thread(save_data, data)
 
-    response = _serialize_user(user_record, data.get("user_connections", []))
+    response = _serialize_user(user_record, data)
     _idempotency_put(idempotency_key, 200, response)
     return response
 
@@ -472,13 +495,13 @@ async def list_users(
     from .app import load_data
 
     data = load_data()
-    users = data.get("external_users", [])
+    users = [u for u in data.get("users", []) if u.get("external_id")]
     if status:
         users = [u for u in users if u.get("status") == status]
     if expiring_before:
         try:
             cutoff = _parse_iso(expiring_before)
-            users = [u for u in users if _parse_iso(u["expires_at"]) <= cutoff]
+            users = [u for u in users if u.get("expires_at") and _parse_iso(u["expires_at"]) <= cutoff]
         except ValueError as e:
             raise HTTPException(400, "expiring_before must be ISO 8601") from e
     total = len(users)
@@ -486,9 +509,8 @@ async def list_users(
     page = max(1, page)
     start = (page - 1) * limit
     page_items = users[start : start + limit]
-    conns = data.get("user_connections", [])
     return {
-        "users": [_serialize_user(u, conns) for u in page_items],
+        "users": [_serialize_user(u, data) for u in page_items],
         "total": total,
         "page": page,
         "limit": limit,
@@ -503,12 +525,8 @@ async def get_user(external_id: str, api_key: dict = Depends(require_api_key)):
     user = _ext_user_by_id(data, external_id)
     if not user:
         raise HTTPException(404, "User not found")
-    summary = _serialize_user(user, data.get("user_connections", []))
-    summary["connections"] = [
-        _serialize_connection(c, data)
-        for c in data.get("user_connections", [])
-        if c.get("external_user_id") == external_id
-    ]
+    summary = _serialize_user(user, data)
+    summary["connections"] = [_serialize_connection(c, data) for c in _user_conns(data, user)]
     return summary
 
 
@@ -532,17 +550,21 @@ async def patch_user(external_id: str, payload: ExtUserPatch, api_key: dict = De
             user["expires_at"] = payload.expires_at
             if prev_status == "expired" and _parse_iso(payload.expires_at) > datetime.now(UTC):
                 user["status"] = "active"
+                user["enabled"] = True
                 user["expiring_soon_notified_at"] = None
                 await _re_enable_connections(data, external_id)
         if payload.status is not None:
             user["status"] = payload.status
             if payload.status == "suspended" and prev_status != "suspended":
+                user["enabled"] = False
                 await _disable_connections(data, external_id)
                 await _broadcast_event("user.suspended", {"external_id": external_id})
+            elif payload.status == "active":
+                user["enabled"] = True
         user["updated_at"] = _now_iso()
         await asyncio.to_thread(save_data, data)
 
-    return _serialize_user(user, data.get("user_connections", []))
+    return _serialize_user(user, data)
 
 
 @router.delete("/users/{external_id}")
@@ -624,15 +646,14 @@ async def create_connection(
     config_text = result.get("config")
     new_conn_id = str(uuid.uuid4())
     async with DATA_LOCK:
-        # Create or update the panel-side panel-user proxy that owns the share token,
-        # so callers get a download URL identical to admin-issued share links.
         data = load_data()
-        user_record = _ensure_panel_user_for_external(data, external_id)
+        user_record = _ext_user_by_id(data, external_id)
+        if not user_record:
+            raise HTTPException(404, "External user not found")
         share_token = _ensure_share_token(user_record)
         conn = {
             "id": new_conn_id,
             "user_id": user_record["id"],
-            "external_user_id": external_id,
             "server_id": server_idx,
             "protocol": payload.protocol,
             "client_id": result["client_id"],
@@ -665,10 +686,16 @@ async def list_connections(external_id: str, api_key: dict = Depends(require_api
     from .app import load_data
 
     data = load_data()
-    if not _ext_user_by_id(data, external_id):
+    user = _ext_user_by_id(data, external_id)
+    if not user:
         raise HTTPException(404, "User not found")
-    conns = [c for c in data.get("user_connections", []) if c.get("external_user_id") == external_id]
+    conns = _user_conns(data, user)
     return {"connections": [_serialize_connection(c, data) for c in conns]}
+
+
+def _conn_belongs_to_ext(data: dict, conn: dict, external_id: str) -> bool:
+    owner = next((u for u in data.get("users", []) if u.get("id") == conn.get("user_id")), None)
+    return bool(owner and owner.get("external_id") == external_id)
 
 
 @router.get("/users/{external_id}/connections/{conn_id}")
@@ -677,7 +704,7 @@ async def get_connection(external_id: str, conn_id: str, api_key: dict = Depends
 
     data = load_data()
     conn = _conn_by_id(data, conn_id)
-    if not conn or conn.get("external_user_id") != external_id:
+    if not conn or not _conn_belongs_to_ext(data, conn, external_id):
         raise HTTPException(404, "Connection not found")
     return _serialize_connection(conn, data)
 
@@ -691,7 +718,7 @@ async def patch_connection(
     async with DATA_LOCK:
         data = load_data()
         conn = _conn_by_id(data, conn_id)
-        if not conn or conn.get("external_user_id") != external_id:
+        if not conn or not _conn_belongs_to_ext(data, conn, external_id):
             raise HTTPException(404, "Connection not found")
         if payload.label is not None:
             conn["label"] = payload.label
@@ -735,7 +762,7 @@ async def delete_connection(external_id: str, conn_id: str, api_key: dict = Depe
 
     data = load_data()
     conn = _conn_by_id(data, conn_id)
-    if not conn or conn.get("external_user_id") != external_id:
+    if not conn or not _conn_belongs_to_ext(data, conn, external_id):
         raise HTTPException(404, "Connection not found")
     sid = conn.get("server_id")
     if isinstance(sid, int) and 0 <= sid < len(data["servers"]):
@@ -831,7 +858,7 @@ async def stats_summary(api_key: dict = Depends(require_api_key)):
     from .app import load_data
 
     data = load_data()
-    users = data.get("external_users", [])
+    users = [u for u in data.get("users", []) if u.get("external_id")]
     conns = data.get("user_connections", [])
     per_server: dict[str, dict[str, Any]] = {}
     conn_counts: dict[int, int] = defaultdict(int)
@@ -854,7 +881,7 @@ async def stats_summary(api_key: dict = Depends(require_api_key)):
             "active_connections": conn_counts.get(idx, 0),
         }
     return {
-        "active_users": sum(1 for u in users if u.get("status") == "active"),
+        "active_users": sum(1 for u in users if u.get("status", "active") == "active"),
         "total_users": len(users),
         "total_connections": len(conns),
         "traffic_24h_bytes": bytes_24h_total,
@@ -867,9 +894,10 @@ async def user_stats(external_id: str, api_key: dict = Depends(require_api_key))
     from .app import load_data
 
     data = load_data()
-    if not _ext_user_by_id(data, external_id):
+    user = _ext_user_by_id(data, external_id)
+    if not user:
         raise HTTPException(404, "User not found")
-    conns = [c for c in data.get("user_connections", []) if c.get("external_user_id") == external_id]
+    conns = _user_conns(data, user)
     breakdown = []
     total = 0
     for c in conns:
@@ -929,45 +957,17 @@ def _parse_iso(value: str) -> datetime:
     return dt
 
 
-def _ensure_panel_user_for_external(data: dict, external_id: str) -> dict:
-    """Get-or-create a panel-side user record that owns the share token for an external user.
-
-    Reuses the existing panel ``users`` table so the share-link UI keeps working
-    for connections issued via the external API. The record is marked with
-    ``ext_user_id`` to distinguish it from regular admin/local accounts.
-    """
-    for u in data["users"]:
-        if u.get("ext_user_id") == external_id:
-            return u
-    new_user = {
-        "id": str(uuid.uuid4()),
-        "username": f"ext_{external_id}",
-        "password_hash": "",
-        "role": "user",
-        "enabled": True,
-        "created_at": _now_iso(),
-        "ext_user_id": external_id,
-        "share_enabled": True,
-        "share_token": secrets.token_urlsafe(16),
-        "share_password_hash": None,
-        "traffic_used": 0,
-        "traffic_total": 0,
-        "traffic_limit": 0,
-        "traffic_reset_strategy": "never",
-        "last_reset_at": _now_iso(),
-        "expiration_date": None,
-    }
-    data["users"].append(new_user)
-    return new_user
-
-
 async def _disable_connections(data: dict, external_id: str) -> list[str]:
     """Toggle off every connection for the given external user. Best-effort SSH calls."""
     from .app import get_protocol_manager, get_ssh
 
+    user = _ext_user_by_id(data, external_id)
+    if not user:
+        return []
+    uid = user["id"]
     affected: list[str] = []
     for conn in data.get("user_connections", []):
-        if conn.get("external_user_id") != external_id:
+        if conn.get("user_id") != uid:
             continue
         affected.append(conn["id"])
         sid = conn.get("server_id")
@@ -996,8 +996,12 @@ async def _disable_connections(data: dict, external_id: str) -> list[str]:
 async def _re_enable_connections(data: dict, external_id: str) -> None:
     from .app import get_protocol_manager, get_ssh
 
+    user = _ext_user_by_id(data, external_id)
+    if not user:
+        return
+    uid = user["id"]
     for conn in data.get("user_connections", []):
-        if conn.get("external_user_id") != external_id:
+        if conn.get("user_id") != uid:
             continue
         sid = conn.get("server_id")
         if isinstance(sid, int) and 0 <= sid < len(data["servers"]):
@@ -1031,7 +1035,11 @@ async def _cascade_delete_user(external_id: str) -> None:
     )
 
     data = load_data()
-    targets = [c for c in data.get("user_connections", []) if c.get("external_user_id") == external_id]
+    user = _ext_user_by_id(data, external_id)
+    if not user:
+        return
+    uid = user["id"]
+    targets = [c for c in data.get("user_connections", []) if c.get("user_id") == uid]
     for conn in targets:
         sid = conn.get("server_id")
         if isinstance(sid, int) and 0 <= sid < len(data["servers"]):
@@ -1055,12 +1063,12 @@ async def _cascade_delete_user(external_id: str) -> None:
 
     async with DATA_LOCK:
         data = load_data()
-        data["user_connections"] = [
-            c for c in data.get("user_connections", []) if c.get("external_user_id") != external_id
-        ]
-        data["external_users"] = [u for u in data.get("external_users", []) if u["external_id"] != external_id]
-        # Drop the panel-side proxy user record too, so it doesn't pile up forever.
-        data["users"] = [u for u in data.get("users", []) if u.get("ext_user_id") != external_id]
+        user = _ext_user_by_id(data, external_id)
+        if not user:
+            return
+        uid = user["id"]
+        data["user_connections"] = [c for c in data.get("user_connections", []) if c.get("user_id") != uid]
+        data["users"] = [u for u in data.get("users", []) if u.get("id") != uid]
         await asyncio.to_thread(save_data, data)
 
 
@@ -1084,7 +1092,7 @@ async def _rotate_or_migrate(
 
     data = load_data()
     conn = _conn_by_id(data, conn_id)
-    if not conn or conn.get("external_user_id") != external_id:
+    if not conn or not _conn_belongs_to_ext(data, conn, external_id):
         raise HTTPException(404, "Connection not found")
     protocol = conn["protocol"]
 
@@ -1149,8 +1157,8 @@ async def _rotate_or_migrate(
         target["client_id"] = result["client_id"]
         target["server_id"] = new_server_idx
         target["last_bytes"] = 0
-        await asyncio.to_thread(save_data, data)
-        share_token = _ensure_share_token(_ensure_panel_user_for_external(data, external_id))
+        user = _ext_user_by_id(data, external_id)
+        share_token = _ensure_share_token(user) if user else ""
         await asyncio.to_thread(save_data, data)
 
     response = _serialize_connection(target, data)
@@ -1181,7 +1189,9 @@ async def run_external_sweeper() -> None:
     to_grace_delete: list[str] = []
 
     data = load_data()
-    for u in data.get("external_users", []):
+    for u in data.get("users", []):
+        if not u.get("external_id") or not u.get("expires_at"):
+            continue
         try:
             expires = _parse_iso(u["expires_at"])
         except ValueError:
@@ -1201,6 +1211,7 @@ async def run_external_sweeper() -> None:
             if not user or user.get("status") != "active":
                 continue
             user["status"] = "expired"
+            user["enabled"] = False
             user["updated_at"] = _now_iso()
             affected = await _disable_connections(data, ext_id)
             await asyncio.to_thread(save_data, data)

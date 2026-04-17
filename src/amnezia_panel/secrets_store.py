@@ -30,7 +30,6 @@ SECRET_PATHS: tuple[tuple[str, ...], ...] = (
     ("servers", "*", "password"),
     ("servers", "*", "private_key"),
     ("settings", "sync", "remnawave_api_key"),
-    ("settings", "telegram", "token"),
 )
 
 

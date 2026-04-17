@@ -29,12 +29,11 @@ The GitHub Actions workflow at `.github/workflows/build.yml` runs `lint` → `au
 
 ```
 src/amnezia_panel/          # the package (project.scripts: amnezia-panel)
-  app.py                    # ~3.2k LOC — FastAPI app, routes, startup/migration, background loop
+  app.py                    # FastAPI app, routes, startup/migration, background loop
   ext_api.py                # public HMAC-authenticated REST API at /api/v1/ext
   config.py                 # pydantic-settings Settings() — .env + env vars
   secrets_store.py          # Fernet encryption-at-rest for secrets in data.json
   ssh_manager.py            # Paramiko wrapper with sudo + SFTP helpers
-  telegram_bot.py           # raw Telegram Bot API over httpx, runs as asyncio.Task
   protocols/                # per-protocol remote installers/managers
     awg.py wireguard.py xray.py telemt.py dns.py
 assets/                     # static/ templates/ translations/   (served from settings.assets_dir)
@@ -74,22 +73,24 @@ All writes go through `save_data_async` which serializes behind `DATA_LOCK` (an 
 
 ### Secrets at rest
 
-`secrets_store.py` encrypts a fixed set of paths in `data.json` with Fernet (prefix `enc:v1:`), key at `settings.data_dir / "data.key"` (0o600, generated on first run). Encrypted paths: `servers[*].password`, `servers[*].private_key`, `settings.sync.remnawave_api_key`, `settings.telegram.token`. Encrypt/decrypt are idempotent (safe across migration). `load_data` decrypts; `save_data_async` re-encrypts — if you add a new credential field, extend `SECRET_PATHS`.
+`secrets_store.py` encrypts a fixed set of paths in `data.json` with Fernet (prefix `enc:v1:`), key at `settings.data_dir / "data.key"` (0o600, generated on first run). Encrypted paths: `servers[*].password`, `servers[*].private_key`, `settings.sync.remnawave_api_key`. Encrypt/decrypt are idempotent (safe across migration). `load_data` decrypts; `save_data_async` re-encrypts — if you add a new credential field, extend `SECRET_PATHS`.
 
 ### Background loop
 
 `periodic_background_tasks()` is kicked off in `startup()` and runs every 10 minutes: scrapes per-client byte counters via SSH, updates `traffic_used` / `traffic_total`, checks `traffic_limit` and `expiration_date`, auto-disables users that hit their cap, and optionally syncs users from Remnawave. It also fires `ext_api.fire_server_unreachable_event` / `fire_quota_exhausted_event` and calls `ext_api.run_external_sweeper()` — so anything new that should generate a webhook belongs there. Traffic-reset strategies (`daily`/`weekly`/`monthly`/`never`) are applied in this loop.
 
-### Telegram bot
+### Identity model
 
-`telegram_bot.py` uses the raw Telegram Bot API via `httpx` (there is no `python-telegram-bot` dep). It runs as an `asyncio.Task` alongside FastAPI — `launch_bot()` is called from `startup()` if `settings.telegram.enabled`, and can be toggled at runtime. `is_running()` / `stop_bot()` are the control surface.
+Single admin, unified users list. `data["admin"]` is a singular object (`{id, username, password_hash}`) — only identity that can log in. `data["users"]` is one list of managed VPN-client entities with heterogeneous origins: panel-created (no extra marker), Remnawave-synced (`remnawave_uuid` set), or external-API-created (`external_id` + optional `expires_at`/`status`/`label`). No `role`, `password_hash`, or `telegramId` on user entries. Customers never log in; config delivery is via `/share/<token>` links the admin enables per user.
+
+`ADMIN_PASSWORD_RESET` env var, if set at boot, overwrites the admin password and logs a warning. Intended as the only recovery path — unset and restart once used.
 
 ### Auth & API shape
 
 Two surfaces, different auth models:
 
-- **Panel (cookie sessions).** `get_current_user(request)` reads `request.session['user_id']` and gates every protected HTML/JSON route. `_check_admin(request)` layers a role check on top. Share links (`/share/<token>`) are the only unauthenticated panel path — they serve password-protected config downloads without panel access.
-- **External API (`/api/v1/ext`, `ext_api.py`).** HMAC-SHA256 signed requests: `X-API-Key` + `X-Timestamp` + `X-Signature` over `method\npath\ntimestamp\nbody_sha256`. ±300 s clock skew. Per-key token-bucket rate limits (60/min reads, 10/min writes). Idempotency, rate-limit state, and webhook delivery state are **in-process only and lost on restart** (documented there). Intended for an upstream billing portal; external API keys are stored encrypted (hashed) in `data.json`. When you add an endpoint here, route state changes through `save_data_async` and SSH calls through the same `get_protocol_manager` pipeline — don't build a parallel one.
+- **Panel (cookie sessions).** `get_current_user(request)` reads `request.session['user_id']` and returns `data["admin"]` if it matches, else `None`. `_check_admin(request)` is an alias — any authenticated session is the admin. Share links (`/share/<token>`) are the only unauthenticated panel path; they use `share_token` + optional `share_password_hash` on a user record and are independent of admin auth.
+- **External API (`/api/v1/ext`, `ext_api.py`).** HMAC-SHA256 signed requests: `X-API-Key` + `X-Timestamp` + `X-Signature` over `method\npath\ntimestamp\nbody_sha256`. ±300 s clock skew. Per-key token-bucket rate limits (60/min reads, 10/min writes). Idempotency, rate-limit state, and webhook delivery state are **in-process only and lost on restart** (documented there). Intended for an upstream billing portal; external API keys are stored encrypted (hashed) in `data.json`. Ext-API user endpoints read/write the unified `data["users"]` list, filtered by `external_id`. Connections reference their owner exclusively via `user_connections[].user_id` (legacy `external_user_id` is stripped at migration time). When you add an endpoint here, route state changes through `save_data_async` and SSH calls through the same `get_protocol_manager` pipeline — don't build a parallel one.
 
 ### SSL
 
