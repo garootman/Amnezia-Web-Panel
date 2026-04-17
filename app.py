@@ -19,10 +19,7 @@ from typing import Optional, List, Dict
 import uvicorn
 import httpx
 
-try:
-    from multicolorcaptcha import CaptchaGenerator
-except ImportError:
-    CaptchaGenerator = None
+from multicolorcaptcha import CaptchaGenerator
 
 from ssh_manager import SSHManager
 from awg_manager import AWGManager
@@ -46,7 +43,9 @@ if getattr(sys, 'frozen', False):
 else:
     application_path = os.path.dirname(__file__)
 
-DATA_FILE = os.path.join(application_path, 'data.json')
+DATA_DIR = os.environ.get('DATA_DIR') or application_path
+os.makedirs(DATA_DIR, exist_ok=True)
+DATA_FILE = os.path.join(DATA_DIR, 'data.json')
 CURRENT_VERSION = "v1.4.2"
 
 
@@ -194,9 +193,6 @@ async def perform_delete_user(data: dict, user_id: str):
             logger.warning(f"Failed to remove connection {uc['client_id']} during user delete: {e}")
     data['user_connections'] = [c for c in data.get('user_connections', []) if c['user_id'] != user_id]
     data['users'] = [u for u in data['users'] if u['id'] != user_id]
-    return True
-
-
     return True
 
 
@@ -466,7 +462,7 @@ def tpl(request, template, **kwargs):
         'all_translations_json': json.dumps(TRANSLATIONS)
     }
     ctx.update(kwargs)
-    return templates.TemplateResponse(template, ctx)
+    return templates.TemplateResponse(request, template, ctx)
 
 
 # ======================== Pydantic Models ========================
@@ -937,10 +933,6 @@ async def my_connections_page(request: Request):
 
 @app.get('/api/auth/captcha')
 async def api_captcha(request: Request):
-    if not CaptchaGenerator:
-        return JSONResponse({"error": "multicolorcaptcha is not installed"}, status_code=500)
-    
-    # 2 is a multiplier for the image resolution size
     generator = CaptchaGenerator(2)
     captcha = generator.gen_captcha_image(difficult_level=2)
     request.session['captcha_answer'] = captcha.characters
@@ -2257,7 +2249,7 @@ if __name__ == '__main__':
     key_file = ssl_conf.get('key_path')
     
     # If text is provided, create temporary files
-    temp_dir = os.path.join(os.getcwd(), 'ssl_temp')
+    temp_dir = os.path.join(DATA_DIR, 'ssl_temp')
     if ssl_conf.get('enabled'):
         if ssl_conf.get('cert_text') or ssl_conf.get('key_text'):
             if not os.path.exists(temp_dir):
@@ -2273,10 +2265,14 @@ if __name__ == '__main__':
                 with open(key_file, 'w') as f:
                     f.write(ssl_conf['key_text'].strip() + '\n')
 
+    # Precedence: PANEL_PORT env > settings.ssl.panel_port > 5000
+    port = int(os.environ.get('PANEL_PORT') or ssl_conf.get('panel_port') or 5000)
+    host = os.environ.get('PANEL_HOST', '0.0.0.0')
+
     uvicorn_kwargs = {
         "app": app,
-        "host": "0.0.0.0",
-        "port": ssl_conf.get('panel_port', 5000)
+        "host": host,
+        "port": port,
     }
     
     if ssl_conf.get('enabled') and cert_file and key_file:
