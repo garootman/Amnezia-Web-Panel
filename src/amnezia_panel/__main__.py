@@ -27,18 +27,15 @@ def main() -> None:
             with open(key_file, 'w') as f:
                 f.write(ssl_conf['key_text'].strip() + '\n')
 
-    # Env var > data.json's ssl.panel_port > Settings default (5000).
-    # PANEL_PORT in env is picked up by pydantic-settings; only fall back to ssl.panel_port if env wasn't set.
-    if 'PANEL_PORT' in os.environ:
-        port = settings.panel_port
-    else:
-        port = int(ssl_conf.get('panel_port') or settings.panel_port)
-
-    uvicorn_kwargs = {"app": app, "host": settings.panel_host, "port": port}
+    uvicorn_kwargs = {
+        "app": app,
+        "host": settings.panel_host,
+        "port": settings.panel_port,
+    }
 
     if ssl_conf.get('enabled') and cert_file and key_file:
         if os.path.exists(cert_file) and os.path.exists(key_file):
-            logger.info(f"Starting panel with HTTPS on {ssl_conf.get('domain')} at port {port}")
+            logger.info(f"Starting panel with HTTPS on {ssl_conf.get('domain')} at port {settings.panel_port}")
             uvicorn_kwargs["ssl_certfile"] = cert_file
             uvicorn_kwargs["ssl_keyfile"] = key_file
         else:

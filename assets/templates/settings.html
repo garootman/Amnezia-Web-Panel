@@ -109,10 +109,6 @@
                         {{ _('enable_https') }}
                     </label>
                 </div>
-                <div class="form-group" style="margin-top: var(--space-md);">
-                    <label class="form-label">{{ _('panel_port_label') }}</label>
-                    <input type="number" class="form-input" id="panel_port" value="{{ settings.get('ssl', {}).get('panel_port', 5000) }}" placeholder="5000">
-                </div>
                 <div id="sslFields" style="{% if not settings.get('ssl', {}).get('enabled') %}display:none;{% endif %} margin-top: var(--space-md);">
                     <div class="form-group">
                         <label class="form-label">{{ _('domain_label') }}</label>
@@ -457,7 +453,6 @@
             key_path: document.getElementById('ssl_key_path').value.trim(),
             cert_text: document.getElementById('ssl_cert_text').value.trim(),
             key_text: document.getElementById('ssl_key_text').value.trim(),
-            panel_port: parseInt(document.getElementById('panel_port').value || '5000')
         };
 
         try {

@@ -271,7 +271,6 @@
     "remove_server": "Удалить сервер из панели",
     "ssl_title": "SSL / HTTPS Настройки",
     "enable_https": "Включить HTTPS",
-    "panel_port_label": "Порт панели",
     "domain_label": "Доменное имя",
     "cert_path_label": "Путь к SSL сертификату (.pem)",
     "key_path_label": "Путь к приватному ключу (.pem)",

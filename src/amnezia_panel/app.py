@@ -572,7 +572,6 @@ class SSLSettings(BaseModel):
     key_path: str = ''
     cert_text: str = ''
     key_text: str = ''
-    panel_port: int = 5000
 
 class TelegramSettings(BaseModel):
     token: str = ''
@@ -685,10 +684,15 @@ async def startup():
             'key_path': '',
             'cert_text': '',
             'key_text': '',
-            'panel_port': 5000
         }
         changed = True
         logger.info("Migrated SSL settings")
+
+    # Drop legacy ssl.panel_port — port is configured via PANEL_PORT env / .env now.
+    if 'panel_port' in data.get('settings', {}).get('ssl', {}):
+        data['settings']['ssl'].pop('panel_port', None)
+        changed = True
+        logger.info("Removed legacy ssl.panel_port from data.json (use PANEL_PORT env instead)")
 
     if changed:
         save_data(data)

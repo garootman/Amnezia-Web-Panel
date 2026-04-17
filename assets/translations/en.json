@@ -271,7 +271,6 @@
     "remove_server": "Remove server from panel",
     "ssl_title": "SSL / HTTPS Settings",
     "enable_https": "Enable HTTPS",
-    "panel_port_label": "Panel Port",
     "domain_label": "Domain name",
     "cert_path_label": "SSL Certificate path (.pem)",
     "key_path_label": "Private Key path (.pem)",
