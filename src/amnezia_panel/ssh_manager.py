@@ -61,13 +61,28 @@ class SSHManager:
             self.client.close()
             self.client = None
 
-    def run_command(self, command, timeout=60):
-        """Execute command on remote server."""
+    def run_command(self, command, timeout=60, stdin_data=None):
+        """Execute command on remote server.
+
+        stdin_data, if provided, is written to the remote process's stdin and
+        stdin is then closed. Used to feed the sudo password without exposing
+        it to the remote shell (see run_sudo_command).
+        """
         if not self.client:
             raise ConnectionError("Not connected to server")
 
         logger.info(f"Running command: {command[:100]}...")
         stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
+
+        if stdin_data is not None:
+            try:
+                stdin.write(stdin_data)
+                stdin.flush()
+            finally:
+                try:
+                    stdin.channel.shutdown_write()
+                except Exception:
+                    pass
 
         # Crucial: set timeout on the channel to prevent hanging indefinitely
         stdout.channel.settimeout(timeout)
@@ -86,21 +101,12 @@ class SSHManager:
 
         return out, err, exit_code
 
-    def _sudo_prefix(self):
-        """Get the sudo command prefix with password handling."""
-        if self._is_root:
-            return ""
-        if self.password:
-            # Use sudo -S to read password from stdin
-            escaped_pass = self.password.replace("'", "'\\''")
-            return f"echo '{escaped_pass}' | sudo -S "
-        return "sudo "
-
     def run_sudo_command(self, command, timeout=60):
         """
         Execute command with sudo, automatically handling password.
-        Strips 'sudo ' from the beginning of command if present,
-        and re-adds it with password piping.
+        The password is fed through paramiko's channel stdin rather than being
+        interpolated into a shell `echo '...' |` pipeline, so newlines, quotes,
+        backslashes, or command substitutions in the password cannot inject.
         """
         # Remove existing sudo prefix if present
         clean_cmd = command
@@ -111,14 +117,10 @@ class SSHManager:
             return self.run_command(clean_cmd, timeout=timeout)
 
         if self.password:
-            escaped_pass = self.password.replace("'", "'\\''")
-            # Pipe password directly to sudo -S, preserving original command quoting
-            # 2>/dev/null on echo suppresses '[sudo] password for...' prompt noise
-            full_cmd = f"echo '{escaped_pass}' | sudo -S -p '' {clean_cmd}"
-        else:
-            full_cmd = f"sudo {clean_cmd}"
+            full_cmd = f"sudo -S -p '' {clean_cmd}"
+            return self.run_command(full_cmd, timeout=timeout, stdin_data=self.password + "\n")
 
-        return self.run_command(full_cmd, timeout=timeout)
+        return self.run_command(f"sudo {clean_cmd}", timeout=timeout)
 
     def run_sudo_script(self, script, timeout=120):
         """
@@ -135,14 +137,11 @@ class SSHManager:
         tmp_script = f"/tmp/_amnz_script_{script_hash}.sh"
         self.upload_file(script, tmp_script)
 
-        # Run with sudo
         if self.password:
-            escaped_pass = self.password.replace("'", "'\\''")
-            full_cmd = f"echo '{escaped_pass}' | sudo -S -p '' bash {tmp_script}; rm -f {tmp_script}"
-        else:
-            full_cmd = f"sudo bash {tmp_script}; rm -f {tmp_script}"
+            full_cmd = f"sudo -S -p '' bash {tmp_script}; rm -f {tmp_script}"
+            return self.run_command(full_cmd, timeout=timeout, stdin_data=self.password + "\n")
 
-        return self.run_command(full_cmd, timeout=timeout)
+        return self.run_command(f"sudo bash {tmp_script}; rm -f {tmp_script}", timeout=timeout)
 
     def run_script(self, script, timeout=120):
         """Execute a multi-line script on remote server."""

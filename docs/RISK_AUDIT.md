@@ -6,33 +6,7 @@ Open security findings against the current codebase. Line numbers refer to `src/
 
 ## Open
 
-### M-3 — Peer config appended via `echo "..."` inside double-quoted bash
-
-**Location:** `protocols/awg.py` (`add_client` / peer-append paths around the `docker exec ... echo "{escaped_peer}"` site)
-
-`peer_section` is single-quote escaped, but then placed inside double quotes in the inner `bash -c` string, which re-enables `$var` and `` `backtick` `` expansion. Current values are base64 and can't inject, but any future source (restored config, user-supplied PSK) could smuggle `$(...)` as root on the remote.
-
-Fix: write peer content via SFTP + `docker cp` (same pattern `_save_clients_table` already uses).
-
----
-
-### M-5 — Xray Dockerfile pulls unverified binary from GitHub releases
-
-**Location:** `protocols/xray.py` (Dockerfile build)
-
-`curl -L -o xray.zip https://github.com/.../v1.8.4/Xray-linux-64.zip` with no checksum. Build-time supply-chain risk: a modified binary runs privileged on every VPN server.
-
-Fix: pin the SHA256 of the zip and verify before unzipping.
-
----
-
-### L-3 — `sudo -S` password piping breaks on newlines / backslashes
-
-**Location:** `ssh_manager.py` — `_sudo_prefix` / password escape
-
-Single-quote escape handles embedded `'` but a password containing `\n` terminates the `echo` early and injects the remainder. Requires an unusual password; field has no length/charset validation.
-
-Fix: pass the password via env var and `printf '%s\n' "$PW" | sudo -S`, or use `pexpect`.
+_(none — all tracked findings resolved)_
 
 ---
 
@@ -51,7 +25,10 @@ Fix: pass the password via env var and `printf '%s\n' "$PW" | sudo -S`, or use `
 - **H-6 (event-loop-blocking save inside background lock)** — traffic sync save runs via `asyncio.to_thread(save_data, ...)` inside the lock.
 - **M-1 (`perform_delete_user` blocked event loop)** — SSH calls wrapped in `asyncio.to_thread`.
 - **M-2 (Remnawave username collision overwrites local hash)** — username fallback match restricted to users with empty `password_hash`.
+- **M-3 (peer config appended via `echo "..."` inside double-quoted bash)** — both AWG peer-append sites (`add_client`, toggle) now fetch the current config, append the new `[Peer]` section in Python, upload via SFTP, and `docker cp` the full file into the container — matching the pattern already used by `save_server_config` / `_save_clients_table`. No remote-shell interpolation of peer content remains.
 - **M-4 (AWG params shell injection via restored backup)** — `sanitize_awg_params` coerces every param to a non-negative integer string before `_configure_container` interpolates them.
+- **M-5 (Xray Dockerfile pulls unverified binary)** — Dockerfile now verifies SHA256 `2a855f610008a598b88424435aefaee1df2c1b0fa1296d4f8f60080b528c9971` (from the upstream `Xray-linux-64.zip.dgst`) with `sha256sum -c` before unzipping; build fails fast if the archive is tampered with.
 - **L-1 (open redirect via `Referer`)** — `set_lang` forces redirects to same-origin paths only.
 - **L-2 (backup restore bypassed migrations)** — restore runs `_apply_schema_migrations` before persisting.
+- **L-3 (`sudo -S` password piping breaks on newlines / backslashes)** — `SSHManager.run_command` now accepts `stdin_data`; `run_sudo_command` / `run_sudo_script` write the password to paramiko's channel stdin instead of interpolating it into an `echo '...' |` pipeline, so arbitrary bytes (newlines, backslashes, `$(...)`) in the password cannot break out of the shell. `_sudo_prefix` helper was deleted.
 - **L-4 (AWG `_next_ip` walks past `.254`)** — allocator raises `RuntimeError` when the /24 is exhausted.

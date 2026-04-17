@@ -868,9 +868,12 @@ PresharedKey = {psk}
 AllowedIPs = {client_ip}/32
 
 """
-        # Append peer to server config
-        escaped_peer = peer_section.replace("'", "'\\''")
-        self.ssh.run_sudo_command(f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'")
+        # Append peer via SFTP + docker cp to avoid remote shell expansion.
+        current_config = self._get_server_config(protocol_type)
+        new_config = current_config.rstrip("\n") + "\n" + peer_section
+        self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
+        self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}")
+        self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
 
         # Sync config without restart
         self.ssh.run_sudo_command(
@@ -1076,10 +1079,11 @@ PresharedKey = {psk}
 AllowedIPs = {client_ip}/32
 
 """
-            escaped_peer = peer_section.replace("'", "'\\''")
-            self.ssh.run_sudo_command(
-                f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'"
-            )
+            current_config = self._get_server_config(protocol_type)
+            new_config = current_config.rstrip("\n") + "\n" + peer_section
+            self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
+            self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}")
+            self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
         else:
             # Remove peer from server config
             config = self._get_server_config(protocol_type)

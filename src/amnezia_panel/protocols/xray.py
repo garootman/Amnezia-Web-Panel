@@ -81,6 +81,7 @@ RUN apk add --no-cache curl unzip bash openssl netcat-openbsd dumb-init rng-tool
 RUN apk --update upgrade --no-cache
 RUN mkdir -p /opt/amnezia/xray
 RUN curl -L -H "Cache-Control: no-cache" -o /root/xray.zip "https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip" && \\
+    echo "2a855f610008a598b88424435aefaee1df2c1b0fa1296d4f8f60080b528c9971  /root/xray.zip" | sha256sum -c - && \\
     unzip /root/xray.zip -d /usr/bin/ && \\
     chmod a+x /usr/bin/xray && \\
     rm /root/xray.zip
