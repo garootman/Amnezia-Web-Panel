@@ -17,9 +17,12 @@ Do these in the order below. Each phase is independently shippable — don't try
 - [x] **Configurable port/host** — env > data.json > default, honoured by package entrypoint, Dockerfile, compose
 - [x] **Partial Phase 4.5** — unreachable `return True` removed, dead `CaptchaGenerator` import fallback removed, Russian Dockerfile comments gone
 - [x] **Starlette 1.x fix** (collateral) — `TemplateResponse(request, name, ctx)` signature update, silently broken after dep upgrade
-- [ ] Phase 2.2 — `app.py` split into `auth.py` / `data.py` / `background.py` / `sync.py` / route modules *(deferred — the 2.3k-LOC file still lives as one module under the package)*
+- [x] **Partial Phase 4.1** — ruff config lives in `pyproject.toml` with the planned rule set; *not* wired into pre-commit or CI yet, so nothing fails a run that ignores it
+- [ ] Phase 2.2 — `app.py` split into `auth.py` / `data.py` / `background.py` / `sync.py` / route modules *(deferred — the 2.2k-LOC file still lives as one module under the package)*
 - [ ] Phase 2.4 — Normalize `WireGuardManager` signatures and delete `_manager_call`
-- [ ] Phase 4.1–4.4, 4.6, 4.7 — ruff wiring, `.editorconfig`, Taskfile, CHANGELOG, version from metadata
+- [ ] Phase 4.1 (remainder) — pre-commit hook + CI gate for `ruff check`/`ruff format --check`
+- [ ] Phase 4.3, 4.4, 4.6, 4.7 — Taskfile, `.editorconfig`, CHANGELOG, version from metadata
+- [~] Phase 4.2 — Type checking intentionally **skipped**. We don't use `mypy`; if we ever add one, it'd be `ty` (Astral). Revisit only if a concrete type-safety incident motivates it.
 
 ---
 
@@ -74,6 +77,8 @@ dev = [
 
 Generate `uv.lock` with `uv lock` and commit it.
 
+> **Shipped note:** we ended up using `hatchling` as the build backend instead of `uv_build`. `hatchling` was already battle-tested, knows how to find `src/amnezia_panel` via `[tool.hatch.build.targets.wheel]`, and doesn't tie the build step to a specific uv version. `uv_build` is fine but adds a pin without a payoff here. Dev deps also shrank to `ruff` + `pyinstaller`; `mypy` and `pytest` were dropped — see Phase 4.2. `itsdangerous` had to come back as a direct dep because `SessionMiddleware` imports it without declaring it transitively.
+
 ### 1.2 Delete dead dependencies
 
 `requirements.txt` ships libraries the code does not use. Verified by grep:
@@ -89,6 +94,21 @@ End state: ~12 direct deps instead of 37. Lockfile guarantees reproducibility.
 ### 1.3 Update `.python-version`
 
 Add a top-level `.python-version` file containing `3.12` (or whichever you settle on). CI currently uses 3.11, Dockerfile uses 3.14-slim — pick one and stop drifting.
+
+> **Shipped note:** settled on 3.12. `.python-version`, `pyproject.toml` (`requires-python = ">=3.12"`), and the Dockerfile (`ghcr.io/astral-sh/uv:python3.12-bookworm-slim` + `python:3.12-slim-bookworm`) all agree. If you touch any one of them, touch the other two.
+
+### 1.4 Typed settings via `pydantic-settings` *(collateral, shipped)*
+
+`app.py` used to pluck `os.environ.get("SECRET_KEY")`, `os.environ.get("PANEL_PORT")`, etc. from whatever part of the file they were needed in, with string defaults inline and no validation. That's fine for two env vars; we have five, with more coming.
+
+Landed:
+
+- `src/amnezia_panel/config.py` defines a `Settings(BaseSettings)` with `PANEL_HOST`, `PANEL_PORT`, `SECRET_KEY`, `DATA_DIR`, `ASSETS_DIR`. `.env` is read in local dev; in Docker we pass env vars directly (see `.dockerignore` — `.env` is excluded from the image).
+- Resolution order is **env > `data.json` > built-in default** for host/port: env wins for container deploys, `data.json` lets an operator pin things from the panel UI, default (`0.0.0.0:5000`) is the fallback. This is asymmetric with how most settings flow but is deliberate: we want ops to be able to set the listen port without editing JSON, and we want the UI to be able to pin it if they prefer that.
+- `DATA_DIR` defaults to `Path(sys.executable).parent` when frozen, else repo root. Override to `/app/data` in Docker. `ASSETS_DIR` does the same for `assets/`.
+- `.env.example` committed, `.env` gitignored. The launcher (`__main__.py`) reads `Settings()` once and hands it to uvicorn.
+
+This is the one place where the modernization pass added a real abstraction rather than deleting one. Worth it: it gives us a single place to document and validate runtime config, and makes the Docker image env-pure.
 
 ---
 
@@ -214,23 +234,13 @@ Wins: smaller image (no uv in final), non-root user (currently runs as root — 
 
 **Caveat:** the app writes `data.json` and `ssl_temp/` to the working directory. With a non-root user you need a mounted volume (`/app/data`) and a settings change to put `data.json` there — see `RISK_AUDIT.md` H-1 for the atomic-write fix; bundle the volume move with that.
 
-### 3.2 GitHub Actions: use `astral-sh/setup-uv`
+### 3.2 GitHub Actions: collapse the PyInstaller matrix into one Docker build
 
-Current `.github/workflows/build.yml` does `pip install pyinstaller && pip install -r requirements.txt` on every OS. Replace with:
+Current `.github/workflows/build.yml` did `pip install pyinstaller && pip install -r requirements.txt` on Linux **and** Windows **and** macOS, producing three single-file binaries as release artifacts. That made sense before Docker was the primary distribution channel. It doesn't now — compose/Dockerfile is the documented path, the frozen binaries carried a stale list of bundled `--add-data` paths, and nobody downloads the macOS build.
 
-```yaml
-- uses: actions/checkout@v4
-- uses: astral-sh/setup-uv@v7
-  with:
-    python-version: "3.12"
-    enable-cache: true
-- run: uv sync --locked
-- run: uv run pyinstaller ...
-```
+Shipped replacement: a single `build` job on `ubuntu-latest` that runs `docker/build-push-action@v6` against the new multistage Dockerfile. Cache via GHA cache backend. A second `publish` job pushes to GHCR under `ghcr.io/<repo>` but is gated on `if: false` until we're ready to flip the switch (needs: a Docker Hub or GHCR decision, tagging rules, and whoever owns the release to say go).
 
-`setup-uv` handles caching automatically and restores `uv.lock`-based installs in seconds. Drop the explicit `pip install --upgrade pip` dance.
-
-Also: the PyInstaller `--add-data` paths change once `assets/` moves — update all three OS branches.
+> **Shipped note:** if you ever want to resurrect the PyInstaller binaries (e.g., for an ops team that can't run Docker), the `--add-data` list needs `assets/static`, `assets/templates`, `assets/translations` — not the pre-`src/` paths. Use `uv run pyinstaller` via `astral-sh/setup-uv@v7`. But the default assumption is: Docker is the artifact, PyInstaller is gone.
 
 ---
 
@@ -249,13 +259,25 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 ignore = ["E501"]  # line length handled by formatter
 ```
 
-Current code has **no linter, no formatter, no type checker**. Adopt ruff (fast, single tool for lint+format) and wire it into pre-commit. Don't bother with Black — ruff does the formatting now.
+Config above has already shipped in `pyproject.toml`. What's **missing** is any mechanism that actually enforces it — a dev can push without ever running `ruff check`, and CI never notices. Two cheap steps to close that gap:
 
-Start with `uv run ruff check --fix` on a throwaway branch to see the scale. Expect ~200 auto-fixable issues (unused imports, old-style string formatting, mutable defaults).
+1. **Pre-commit hook** — add `.pre-commit-config.yaml` pinning `ruff` and `ruff-format`, tell `CONTRIBUTING.md` to run `pre-commit install`. Don't force pre-commit on contributors who don't want it; the CI gate catches everything the hook would.
+2. **CI gate** — add a `lint` job to `.github/workflows/build.yml` that runs `uv run ruff check` and `uv run ruff format --check`. Make it a required status check once the baseline is clean.
 
-### 4.2 Add `mypy --strict` in report-only mode
+Before landing either, run `uv run ruff check --fix` on a throwaway branch to see the scale — expect ~200 auto-fixable issues (unused imports, old-style string formatting, mutable defaults). Fix them in a single "ruff baseline" commit so `git blame` still works for real changes.
 
-Type hints already exist in Pydantic models but not on the hundreds of helper functions. Run `mypy src/` with `--strict` but start with `--no-error-summary` in CI; fix modules incrementally over several PRs rather than turning it on all at once.
+Don't bother with Black, isort, or flake8 — ruff replaces all of them.
+
+### 4.2 Type checking — decision: skip
+
+We don't run a type checker on this codebase and the modernization pass isn't going to add one. Concretely: no `mypy` (it was never a fit and it's not in dev deps), and no `ty` either for now — even though `ty` would be the natural choice given the rest of the toolchain is Astral.
+
+Why skip: `app.py` is 2.2k LOC of route handlers with Pydantic-validated inputs at the boundary, and the real failure modes (SSH injection, missing `perform_toggle_user`, torn `data.json` writes — see `RISK_AUDIT.md`) aren't things a type checker would have caught. The cost of retrofitting annotations across the codebase far exceeds the expected bug-catch value at the current size.
+
+Revisit if one of these happens:
+- A production incident is traceable to a type error a checker would have caught.
+- Phase 2.2 lands and the resulting modules are small enough that annotating them is a few hours per module. At that point reach for `ty`, not `mypy`.
+- A contributor volunteers to own it. Don't introduce a type checker as a drive-by — a half-annotated codebase with blanket ignores is worse than none.
 
 ### 4.3 Add a `Taskfile.yml` or `justfile`
 
@@ -315,18 +337,30 @@ Current release process is "bump `CURRENT_VERSION` constant in `app.py:50` and p
 
 ## Suggested PR breakdown
 
-| PR | Scope | Ships |
-|---|---|---|
-| #1 | Phase 1.1 + 1.2 | `pyproject.toml`, `uv.lock`, delete `requirements.txt`, delete dead deps. No code moves. |
-| #2 | Phase 1.3 + 3.2 | `.python-version`, CI switches to `setup-uv`. |
-| #3 | Phase 3.1 | New multistage Dockerfile. Coordinate with `RISK_AUDIT.md` H-1 (data dir volume). |
-| #4 | Phase 2.1 + 2.2 | `src/` layout move, split `app.py` into modules. **This PR is the scary one** — land it when no feature work is in flight. |
-| #5 | Phase 2.3 + 2.4 | Clean imports, normalize manager signatures, delete `_manager_call`. |
-| #6 | Phase 4.1 + 4.4 + 4.5 | ruff config, `.editorconfig`, dead-code sweep. |
-| #7 | Phase 4.3 + 4.6 + 4.7 | Taskfile, CHANGELOG, version single-sourcing. |
-| #8 | Phase 4.2 | mypy adoption, incremental. |
+### Already shipped (for reference)
 
-Ship PRs #1–#3 first — they're cheap wins with near-zero diff in application code. Save the `src/` move for when the repo is quiet.
+| Commit(s) | Scope |
+|---|---|
+| `8ced98e`, `0ad6d42` | Phase 1.1 + 1.2 + 1.3 + 2.1 + 2.3 + 3.1 — uv migration, `src/` layout, multistage Dockerfile, dead deps dropped. |
+| `0ad6d42` (collateral) | Phase 1.4 — `pydantic-settings`, typed `Settings`, `.env` support. |
+| `f832e9f`, `5db3dc0`, `3fc8beb` | Env-vs-`data.json` resolution for `PANEL_HOST`/`PANEL_PORT`, `.env` in dev / env-only in Docker, launcher honours `PANEL_PORT`. |
+| (part of the same arc) | Phase 3.2 — PyInstaller matrix removed, single Docker `build` job, `publish`-to-GHCR job gated behind `if: false`. |
+| (inline) | Partial Phase 4.5 — unreachable `return True`, dead `CaptchaGenerator` fallback, Russian Dockerfile comments. |
+| (inline) | Starlette 1.x fix (`TemplateResponse(request, name, ctx)` signature). |
+
+### Remaining
+
+| PR | Scope | Notes |
+|---|---|---|
+| #A | Phase 2.4 | Give `WireGuardManager.get_clients`/`add_client`/etc. a `protocol_type='wireguard'` no-op parameter; delete `_manager_call`; rewrite the ~10 call sites in `app.py` (see `app.py:139`, plus lines 181/230/240/258/718/1160/1399/1490). Pure mechanical refactor, near-zero risk. Ship first — it pays off every time someone reads Phase 2.2. |
+| #B | Phase 4.1 (remainder) + 4.4 | `.editorconfig`, `pre-commit-config.yaml`, a `lint` job in the workflow, and the one-shot `uv run ruff check --fix` baseline commit. Keep baseline as its own commit so `git blame` survives. |
+| #C | Phase 4.7 | `CURRENT_VERSION` in `app.py:42` → `importlib.metadata.version("amnezia-web-panel")`. Bump `docker-compose.yml` image tag in the same PR so the three version strings actually align. |
+| #D | Phase 4.3 + 4.6 | `Taskfile.yml` (or `justfile`), `CHANGELOG.md`, `CONTRIBUTING.md`. Backfill the changelog from `git log` — don't try to reconstruct pre-modernization history, start from `v1.4.2`. |
+| #E | Phase 2.2 | **The scary one.** Split `app.py` into `auth.py` / `data.py` / `background.py` / `sync.py` / `i18n.py` / `__main__.py` (+ optional `routes/*.py`). Do it when no feature work is in flight; land in a single PR rather than drip-feeding (partial splits leak circular imports). Coordinate with `RISK_AUDIT.md` H-1 — the atomic-write fix naturally belongs in the new `data.py`, so pull both into the same PR. |
+
+Order: **A → B → C → D → E.** A/B/C/D are each a focused afternoon. E is a day of careful work and needs a quiet window on `main`.
+
+Phase 4.2 (mypy) is **not** in this list — see §4.2.
 
 ---
 
