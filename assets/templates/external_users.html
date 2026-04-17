@@ -1,0 +1,261 @@
+{% extends "base.html" %}
+
+{% block title_extra %} — {{ _('ext_users_title') }}{% endblock %}
+
+{% block content %}
+<section>
+    <div class="flex items-center justify-between"
+        style="margin-bottom: var(--space-lg); gap: var(--space-md); flex-wrap: wrap;">
+        <h1 class="section-title" style="margin-bottom:0; flex-shrink: 0;">
+            <span class="icon">🌐</span>
+            {{ _('ext_users_title') }}
+        </h1>
+
+        <div style="flex: 1; min-width: 250px; max-width: 400px; position: relative;">
+            <input type="text" class="form-input" id="extSearch" placeholder="{{ _('ext_users_search') }}"
+                oninput="onSearch(this.value)" style="padding-left: 40px;">
+            <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); opacity: 0.5;">🔍</span>
+        </div>
+
+        <select class="form-select" id="statusFilter" style="max-width: 180px;" onchange="reload()">
+            <option value="">{{ _('ext_status_all') }}</option>
+            <option value="active">{{ _('ext_status_active') }}</option>
+            <option value="expired">{{ _('ext_status_expired') }}</option>
+            <option value="suspended">{{ _('ext_status_suspended') }}</option>
+        </select>
+
+        <button class="btn btn-primary" onclick="openModal('addExtUserModal')" style="flex-shrink: 0;">
+            <span>＋</span> {{ _('ext_users_add') }}
+        </button>
+    </div>
+
+    <div class="card" style="overflow-x: auto;">
+        <table class="data-table" style="width: 100%; border-collapse: collapse;">
+            <thead>
+                <tr style="text-align: left; border-bottom: 1px solid var(--border-color);">
+                    <th style="padding: var(--space-sm);">external_id</th>
+                    <th style="padding: var(--space-sm);">{{ _('ext_users_label') }}</th>
+                    <th style="padding: var(--space-sm);">{{ _('ext_users_status') }}</th>
+                    <th style="padding: var(--space-sm);">{{ _('ext_users_expires') }}</th>
+                    <th style="padding: var(--space-sm);">#</th>
+                    <th style="padding: var(--space-sm);">GB</th>
+                    <th style="padding: var(--space-sm);">{{ _('actions') }}</th>
+                </tr>
+            </thead>
+            <tbody id="extUsersTbody">
+                <tr><td colspan="7" style="padding: var(--space-lg); text-align: center; color: var(--text-muted);">{{ _('loading') }}</td></tr>
+            </tbody>
+        </table>
+
+        <div id="extPagination"
+            style="display: flex; justify-content: center; align-items: center; gap: var(--space-md); margin-top: var(--space-md); padding: var(--space-md);">
+            <button class="btn btn-secondary btn-sm" onclick="changePage(-1)">{{ _('prev_page') }}</button>
+            <span id="extPageInfo" style="font-weight: 600; font-size: 0.9rem;"></span>
+            <button class="btn btn-secondary btn-sm" onclick="changePage(1)">{{ _('next_page') }}</button>
+        </div>
+    </div>
+</section>
+
+<!-- ===== Add External User Modal ===== -->
+<div class="modal-backdrop" id="addExtUserModal">
+    <div class="modal">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _('ext_users_add') }}</h2>
+            <button class="modal-close" onclick="closeModal('addExtUserModal')">×</button>
+        </div>
+
+        <form id="addExtForm" onsubmit="return addExtUser(event)">
+            <div class="form-group">
+                <label class="form-label">external_id</label>
+                <input class="form-input" type="text" id="newExtId" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">{{ _('ext_users_label') }}</label>
+                <input class="form-input" type="text" id="newExtLabel">
+            </div>
+            <div class="form-group">
+                <label class="form-label">{{ _('ext_users_expires') }}</label>
+                <input class="form-input" type="datetime-local" id="newExtExpires" required>
+            </div>
+            <div style="text-align: right; margin-top: var(--space-md);">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('addExtUserModal')">{{ _('cancel') }}</button>
+                <button type="submit" class="btn btn-primary">{{ _('save') }}</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- ===== Drill-down Modal ===== -->
+<div class="modal-backdrop" id="extDetailModal">
+    <div class="modal" style="max-width: 720px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="extDetailTitle">…</h2>
+            <button class="modal-close" onclick="closeModal('extDetailModal')">×</button>
+        </div>
+
+        <div id="extDetailBody"></div>
+    </div>
+</div>
+
+<script>
+    let currentPage = 1;
+    let currentSearch = "";
+    let searchTimer = null;
+
+    function onSearch(v) {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => { currentSearch = v; currentPage = 1; reload(); }, 300);
+    }
+
+    function changePage(d) {
+        currentPage = Math.max(1, currentPage + d);
+        reload();
+    }
+
+    async function reload() {
+        const status = document.getElementById('statusFilter').value;
+        const params = new URLSearchParams({ page: currentPage, size: 25 });
+        if (currentSearch) params.set('search', currentSearch);
+        if (status) params.set('status', status);
+        try {
+            const data = await apiCall('/api/admin/external_users?' + params.toString());
+            renderTable(data);
+        } catch (e) {
+            showToast(e.message, 'error');
+        }
+    }
+
+    function badgeForStatus(s) {
+        const cls = s === 'active' ? 'success' : (s === 'expired' ? 'warn' : 'info');
+        return `<span class="badge badge-${cls}">${s}</span>`;
+    }
+
+    function renderTable(data) {
+        const tbody = document.getElementById('extUsersTbody');
+        if (!data.users.length) {
+            tbody.innerHTML = `<tr><td colspan="7" style="padding: var(--space-lg); text-align: center; color: var(--text-muted);">${_('nothing_found')}</td></tr>`;
+        } else {
+            tbody.innerHTML = data.users.map(u => `
+                <tr style="border-bottom: 1px solid var(--border-color);">
+                    <td style="padding: var(--space-sm); font-family: monospace; font-size: 0.85rem;">${u.external_id}</td>
+                    <td style="padding: var(--space-sm);">${u.label || '<span style="color: var(--text-muted)">—</span>'}</td>
+                    <td style="padding: var(--space-sm);">${badgeForStatus(u.status)}</td>
+                    <td style="padding: var(--space-sm); font-size: 0.85rem;">${(u.expires_at || '').slice(0, 16).replace('T', ' ')}</td>
+                    <td style="padding: var(--space-sm);">${u.connections_count}</td>
+                    <td style="padding: var(--space-sm);">${(u.traffic_used_bytes / (1024**3)).toFixed(2)}</td>
+                    <td style="padding: var(--space-sm);">
+                        <button class="btn btn-secondary btn-sm" onclick="openDetail('${u.external_id}')">${_('manage')}</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+        document.getElementById('extPageInfo').textContent = `${data.page} / ${Math.max(1, data.pages || 1)}`;
+    }
+
+    async function addExtUser(e) {
+        e.preventDefault();
+        const expiresLocal = document.getElementById('newExtExpires').value;
+        // datetime-local has no TZ; treat as UTC for an unambiguous wire value.
+        const expiresIso = new Date(expiresLocal + ':00Z').toISOString();
+        try {
+            await apiCall('/api/admin/external_users', 'POST', {
+                external_id: document.getElementById('newExtId').value.trim(),
+                label: document.getElementById('newExtLabel').value || null,
+                expires_at: expiresIso,
+            });
+            closeModal('addExtUserModal');
+            document.getElementById('addExtForm').reset();
+            reload();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+        return false;
+    }
+
+    async function openDetail(externalId) {
+        document.getElementById('extDetailTitle').textContent = externalId;
+        document.getElementById('extDetailBody').innerHTML = `<div style="text-align:center; padding: var(--space-lg);">${_('loading')}</div>`;
+        openModal('extDetailModal');
+        try {
+            const u = await apiCall('/api/admin/external_users/' + encodeURIComponent(externalId));
+            renderDetail(u);
+        } catch (e) {
+            document.getElementById('extDetailBody').innerHTML = `<div style="color: var(--danger);">${e.message}</div>`;
+        }
+    }
+
+    function renderDetail(u) {
+        const conns = (u.connections || []).map(c => `
+            <tr style="border-bottom: 1px solid var(--border-color);">
+                <td style="padding: var(--space-sm); font-family: monospace; font-size: 0.8rem;">${c.id.slice(0, 8)}…</td>
+                <td style="padding: var(--space-sm);">${c.protocol}</td>
+                <td style="padding: var(--space-sm);">${c.server_label || '?'} ${c.region ? `<span class="badge badge-info">${c.region}</span>` : ''}</td>
+                <td style="padding: var(--space-sm);">${c.enabled ? '✓' : '✕'}</td>
+                <td style="padding: var(--space-sm);">${(c.traffic_used / (1024**3)).toFixed(2)} GB</td>
+            </tr>
+        `).join('');
+        document.getElementById('extDetailBody').innerHTML = `
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
+                <div><strong>${_('ext_users_status')}:</strong> ${badgeForStatus(u.status)}</div>
+                <div><strong>${_('ext_users_expires')}:</strong> ${(u.expires_at || '').slice(0, 16).replace('T', ' ')}</div>
+            </div>
+            <h3 style="margin-top: var(--space-lg);">${_('connections')}</h3>
+            <table class="data-table" style="width: 100%; border-collapse: collapse;">
+                <thead>
+                    <tr><th style="padding: var(--space-sm); text-align: left;">id</th><th style="padding: var(--space-sm); text-align: left;">${_('protocol')||'protocol'}</th><th style="padding: var(--space-sm); text-align: left;">${_('host')}</th><th style="padding: var(--space-sm); text-align: left;">${_('status')}</th><th style="padding: var(--space-sm); text-align: left;">${_('traffic')}</th></tr>
+                </thead>
+                <tbody>${conns || `<tr><td colspan="5" style="padding: var(--space-md); text-align:center; color: var(--text-muted);">—</td></tr>`}</tbody>
+            </table>
+
+            <div style="display: flex; gap: var(--space-sm); margin-top: var(--space-lg); flex-wrap: wrap;">
+                <button class="btn btn-secondary btn-sm" onclick="extendExpiry('${u.external_id}', '${u.expires_at}')">${_('ext_extend')}</button>
+                <button class="btn btn-secondary btn-sm" onclick="setStatus('${u.external_id}', 'suspended')">${_('ext_suspend')}</button>
+                <button class="btn btn-secondary btn-sm" onclick="setStatus('${u.external_id}', 'active')">${_('ext_reactivate')}</button>
+                <button class="btn btn-danger btn-sm" style="margin-left: auto;" onclick="deleteExtUser('${u.external_id}')">${_('delete')}</button>
+            </div>
+        `;
+    }
+
+    async function extendExpiry(externalId, current) {
+        const v = prompt(_('ext_extend_prompt'), (current || '').slice(0, 16));
+        if (!v) return;
+        try {
+            const iso = new Date(v + ':00Z').toISOString();
+            await apiCall('/api/admin/external_users/' + encodeURIComponent(externalId), 'PATCH', { expires_at: iso });
+            openDetail(externalId);
+            reload();
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function setStatus(externalId, status) {
+        try {
+            await apiCall('/api/admin/external_users/' + encodeURIComponent(externalId), 'PATCH', { status });
+            openDetail(externalId);
+            reload();
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function deleteExtUser(externalId) {
+        if (!confirm(_('ext_delete_confirm'))) return;
+        try {
+            await fetch('/api/admin/external_users/' + encodeURIComponent(externalId), { method: 'DELETE' });
+            closeModal('extDetailModal');
+            reload();
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    // PATCH/DELETE need to go through fetch since apiCall only handles POST. Override:
+    const _origApiCall = apiCall;
+    window.apiCall = async function (url, method = 'GET', body = null) {
+        const opts = { method, headers: { 'Content-Type': 'application/json' } };
+        if (body) opts.body = JSON.stringify(body);
+        const res = await fetch(url, opts);
+        if (res.status === 401 || res.status === 403) { window.location.href = '/login'; throw new Error('Session expired'); }
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Unknown error');
+        return data;
+    };
+
+    reload();
+</script>
+{% endblock %}

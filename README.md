@@ -3,9 +3,9 @@
 A modern, high-performance web interface for simplified management of AmneziaWG and Xray (XTLS-Reality) servers. Designed to provide a premium user experience with robust administrative capabilities.
 
 > ### 🔄 Compatibility with Official Amnezia Client
-> 
+>
 > This panel is fully compatible with the official **Amnezia** applications!
-> 
+>
 > **How to connect an existing server:**
 > 1. Add your pre-configured server by entering its **IP address**, **login** and **password**
 > 2. Go to the "Added Servers" section
@@ -17,7 +17,7 @@ A modern, high-performance web interface for simplified management of AmneziaWG 
 >
 > ⚡ **After verification, you can manage the server directly from the panel!**
 
-![Servers Dashboard](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/screen/panel1.png)
+![Servers Dashboard](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/docs/screen/panel1.png)
 
 
 ### Additional Sections
@@ -27,7 +27,7 @@ A modern, high-performance web interface for simplified management of AmneziaWG 
 <br>
 User management interface with permissions and access controls:
 
-![Users Management](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/screen/panel1-2.png)
+![Users Management](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/docs/screen/panel1-2.png)
 </details>
 
 <details>
@@ -35,7 +35,7 @@ User management interface with permissions and access controls:
 <br>
 Configuration panel for system parameters and preferences:
 
-![Settings Panel](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/screen/panel1-3.png)
+![Settings Panel](https://github.com/PRVTPRO/Amnezia-Web-Panel/blob/main/docs/screen/panel1-3.png)
 </details>
 
 ## 🚀 Key Features
@@ -75,7 +75,7 @@ Configuration panel for system parameters and preferences:
 
 ## 💡 Need Additional Functionality?
 
-If you require any custom features not currently available in the panel, **let us know – we'll implement them quickly!** 
+If you require any custom features not currently available in the panel, **let us know – we'll implement them quickly!**
 
 * **Database Support**: PostgreSQL, MySQL/MariaDB, SQLite, Oracle, and MS SQL Server
 * **In-Panel File Editor**: Edit configuration files inside containers directly from the web interface
@@ -93,7 +93,7 @@ If you require any custom features not currently available in the panel, **let u
 *   Target servers: **Ubuntu 20.04/22.04/24.04** (Architecture: x86_64 or ARM64).
 *   SSH access to target servers (Password or Private Key).
 
-## 📦 Installation 
+## 📦 Installation
 
 1.  **Clone the repository**:
     ```bash
@@ -132,13 +132,19 @@ Mac
 
 ## 🐳 Docker Image
 
-https://hub.docker.com/r/prvtpro/amnezia-panel
+Published to GitHub Container Registry:
+
+```
+ghcr.io/garootman/amnezia-web-panel:latest
+```
+
+Browse tags at https://github.com/garootman/Amnezia-Web-Panel/pkgs/container/amnezia-web-panel
 
 
 ### Initial Login
 *   **Username**: `admin`
 *   **Password**: `admin`
-> [!IMPORTANT]  
+> [!IMPORTANT]
 > Secure your panel by changing the default password in the **Users** section immediately after first login.
 
 ## 🔧 Project Details
@@ -148,7 +154,65 @@ The project includes self-documenting API endpoints:
 *   **Swagger UI**: `/docs`
 *   **ReDoc**: `/redoc`
 
-> **Note:** The current API is designed exclusively for internal panel operations (requires session authentication). A dedicated public REST API for external integrations is not yet available and would need to be implemented.
+### External REST API (`/api/v1/ext`)
+
+A signed REST API for upstream subscription portals to manage VPN access on behalf of their users. See `docs/EXTERNAL_API.md` for the full reference; the high-level flow:
+
+1. Mint an API key in **Settings → External API keys**. The secret is shown **once** — store it.
+2. Sign every request with HMAC-SHA256 over `f"{ts}\n{method}\n{path}\n{sha256(body)}"` using the secret.
+3. Required headers on every call: `X-API-Key`, `X-Timestamp` (Unix seconds), `X-Signature` (hex).
+4. Webhooks: configure a per-key URL + secret + event list to receive `user.expired`, `connection.provisioned`, `connection.quota_exhausted`, etc.
+
+> **Mandatory: restrict the API to your portal's egress IPs at your reverse proxy.** A leaked API key is equivalent to a leaked admin password — it can mint VPN keys, read traffic, and delete users. There is no in-app IP allowlist; this is enforced at the proxy layer (Nginx `allow`/`deny`, Traefik `IPAllowList`, etc.).
+
+Minimal Python caller:
+
+```python
+import hashlib, hmac, time, json, requests
+
+BASE = "https://panel.example.com"
+KEY_ID = "ak_live_..."
+SECRET = b"hex64..."
+
+def call(method: str, path: str, body: dict | None = None) -> dict:
+    raw = json.dumps(body, separators=(",", ":")).encode() if body else b""
+    ts = str(int(time.time()))
+    body_hash = hashlib.sha256(raw).hexdigest()
+    msg = f"{ts}\n{method}\n{path}\n{body_hash}".encode()
+    sig = hmac.new(SECRET, msg, hashlib.sha256).hexdigest()
+    headers = {
+        "X-API-Key": KEY_ID,
+        "X-Timestamp": ts,
+        "X-Signature": sig,
+        "Content-Type": "application/json",
+    }
+    resp = requests.request(method, BASE + path, headers=headers, data=raw, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+# Provision: portal user → external user → VPN connection.
+call("POST", "/api/v1/ext/users", {
+    "external_id": "portal_user_42",
+    "expires_at": "2026-12-31T00:00:00Z",
+    "label": "user@example.com",
+})
+conn = call("POST", "/api/v1/ext/users/portal_user_42/connections", {
+    "protocol": "wireguard",
+    "region": "eu-west",
+})
+print("share URL:", conn["share_url"])
+
+# Renewal: extend expiry. Re-enables suspended connections automatically.
+call("PATCH", "/api/v1/ext/users/portal_user_42", {"expires_at": "2027-12-31T00:00:00Z"})
+```
+
+Notes on contract semantics:
+
+- `POST /connections` is **not atomically idempotent** (SSH succeeds before DB save). On HTTP 5xx, `GET /users/{id}/connections` before retrying.
+- `Idempotency-Key` header replays the stored response within 24 h, in-process — restart drops the cache.
+- Rate limits per key: 60 reads/min, 10 writes/min. 429 on exhaustion.
+
+> **Note:** The legacy session-authenticated API remains available for the panel UI and is not intended for external integrations.
 
 ### Technology Stack
 *   **Backend**: FastAPI (Python)

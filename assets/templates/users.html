@@ -430,7 +430,7 @@
                         <div>
                             <div class="client-name">
                                 ${u.username}
-                                <span class="badge badge-${u.role === 'admin' ? 'success' : (u.role === 'support' ? 'info' : 'warn')}" 
+                                <span class="badge badge-${u.role === 'admin' ? 'success' : (u.role === 'support' ? 'info' : 'warn')}"
                                       style="font-size:0.65rem; margin-left: var(--space-xs);">
                                     ${u.role.toUpperCase()}
                                 </span>
@@ -484,10 +484,10 @@
                     </div>
                     <div class="client-actions" style="flex-wrap: wrap; justify-content: flex-end; max-width: 140px;">
                         {% if current_user.role == 'admin' %}
-                        <button class="btn btn-secondary btn-sm btn-icon" 
-                                onclick="openAddConnectionForUser('${u.id}', '${u.username}')" 
+                        <button class="btn btn-secondary btn-sm btn-icon"
+                                onclick="openAddConnectionForUser('${u.id}', '${u.username}')"
                                 title="${_('add_connection')}">🔗</button>
-                        <button class="btn btn-secondary btn-sm btn-icon" 
+                        <button class="btn btn-secondary btn-sm btn-icon"
                                 onclick='openEditUser({"id": "${u.id}", "username": "${u.username}", "tg": "${u.telegramId || ""}", "email": "${u.email || ""}", "desc": "${u.description || ""}", "limit": "${u.traffic_limit ? (u.traffic_limit / Math.pow(1024, 3)).toFixed(2) : 0}", "strategy": "${u.traffic_reset_strategy || 'never'}", "expiration": "${u.expiration_date || ''}"})'
                                 title="${_('edit')}">✏️</button>
                         <button class="btn btn-secondary btn-sm btn-icon" onclick="openShareModal(this.dataset)"

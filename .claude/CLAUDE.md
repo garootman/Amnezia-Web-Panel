@@ -4,15 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Run & Build
 
+Dependency and tool management is **uv-only**. There is no `requirements.txt`, no `pip install`, no `venv`/`virtualenv` ceremony — `uv sync` reads `pyproject.toml` + `uv.lock` and provisions `.venv/` itself. Every dev command runs through `uv run …` (or `uvx` for one-shots).
+
 ```bash
-pip install -r requirements.txt
-python app.py                        # local run, binds 0.0.0.0:5000 (or ssl.panel_port)
-docker compose up -d                 # prebuilt image prvtpro/amnezia-panel
+uv sync                              # resolve + install runtime + dev deps from uv.lock
+uv run amnezia-panel                 # local run via project.scripts entrypoint
+# or: uv run python -m amnezia_panel
+docker compose up -d                 # prebuilt image ghcr.io/garootman/amnezia-web-panel
 ```
 
-The GitHub Actions workflow at `.github/workflows/build.yml` packages single-file binaries with PyInstaller for Linux/Windows/macOS on pushes to `main` and tag pushes (`v*`). When editing bundled resources, update the `--add-data` list there (`static`, `templates`, `translations` are currently bundled).
+Common tasks are wired in `Taskfile.yml` (`task dev`, `task run`, `task lint`, `task fmt`, `task audit`, `task check`, `task docker-build`). Use these rather than reinventing flags.
 
-No test suite, linter, or formatter is configured — `pytest`, `ruff`, `mypy` etc. are not dependencies.
+Tooling that **is** configured:
+
+- **ruff** — lint + format; config lives in `[tool.ruff]` in `pyproject.toml` (line-length 120, py312 target, curated rule set). Run `uv run ruff check` / `uv run ruff format`.
+- **uv audit** — OSV vulnerability scan on resolved deps. `uv run` isn't needed; the command is `uv audit --no-group dev --preview-features audit`. Wired in CI and `task audit`.
+
+Tooling that is **not** wired yet — do not assume it exists: no `pytest` (no test suite), no type checker (`mypy`/`ty`/`pyright`), no pre-commit linters beyond ruff. If you add one, register it in `[dependency-groups].dev`, add a `Taskfile.yml` entry, and wire it into `.github/workflows/build.yml` alongside `lint` + `audit`.
+
+The GitHub Actions workflow at `.github/workflows/build.yml` runs `lint` → `audit` → `build` → `publish` (GHCR only — no Docker Hub). It does **not** currently produce PyInstaller single-file binaries; if you need those, resurrect the job and bundle `assets/static`, `assets/templates`, `assets/translations` via `--add-data`.
 
 ## Architecture
 
@@ -49,7 +59,7 @@ All writes go through `save_data_async` which serializes behind `DATA_LOCK` (an 
 
 ### Telegram bot
 
-`telegram_bot.py` uses raw Telegram Bot API via `httpx` (not `python-telegram-bot`, despite the dep being in `requirements.txt`). It runs as an `asyncio.Task` alongside FastAPI — `launch_bot()` is called from `startup()` if `settings.telegram.enabled`, and can be toggled at runtime. `is_running()` / `stop_bot()` are the control surface.
+`telegram_bot.py` uses raw Telegram Bot API via `httpx` (there is no `python-telegram-bot` dependency in `pyproject.toml`). It runs as an `asyncio.Task` alongside FastAPI — `launch_bot()` is called from `startup()` if `settings.telegram.enabled`, and can be toggled at runtime. `is_running()` / `stop_bot()` are the control surface.
 
 ### Auth & API shape
 

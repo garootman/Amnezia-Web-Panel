@@ -1,6 +1,6 @@
 services:
   amnezia_panel:
-    image: prvtpro/amnezia-panel:1.4.2
+    image: ghcr.io/garootman/amnezia-web-panel:latest
     container_name: amnezia_panel
     # PANEL_PORT is used as both the in-container listen port and the host publish port.
     # If you need to publish on a different host port (e.g. 5000 is taken on the host),

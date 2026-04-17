@@ -12,7 +12,7 @@ import secrets
 import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 import httpx
 from fastapi import FastAPI, File, Query, Request, UploadFile
@@ -23,7 +23,8 @@ from multicolorcaptcha import CaptchaGenerator
 from pydantic import BaseModel, field_validator
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import secrets_store, telegram_bot as tg_bot
+from . import ext_api, secrets_store
+from . import telegram_bot as tg_bot
 from .config import settings
 from .protocols.awg import AWGManager
 from .protocols.wireguard import WireGuardManager
@@ -111,6 +112,8 @@ def load_data():
     data.setdefault("servers", [])
     data.setdefault("users", [])
     data.setdefault("user_connections", [])
+    data.setdefault("external_users", [])
+    data.setdefault("api_keys", [])
     data.setdefault(
         "settings",
         {
@@ -756,6 +759,25 @@ def _apply_schema_migrations(data: dict) -> bool:
         changed = True
         logger.info("Removed legacy ssl.panel_port from data.json (use PANEL_PORT env instead)")
 
+    # External-API model: stable server UUIDs, region tags, external_users, api_keys, FK on connections.
+    if "external_users" not in data:
+        data["external_users"] = []
+        changed = True
+    if "api_keys" not in data:
+        data["api_keys"] = []
+        changed = True
+    for srv in data.get("servers", []):
+        if "id" not in srv:
+            srv["id"] = str(uuid.uuid4())
+            changed = True
+        if "region" not in srv:
+            srv["region"] = ""
+            changed = True
+    for conn in data.get("user_connections", []):
+        if "external_user_id" not in conn:
+            conn["external_user_id"] = None
+            changed = True
+
     return changed
 
 
@@ -789,6 +811,9 @@ async def startup():
     # Start periodic background tasks. Keep a reference so the task isn't garbage-collected.
     _BACKGROUND_TASKS.add(asyncio.create_task(periodic_background_tasks()))
 
+    # External API webhook delivery consumer.
+    ext_api.start_webhook_consumer(_BACKGROUND_TASKS)
+
     # Start Telegram bot if enabled
     tg_cfg = data.get("settings", {}).get("telegram", {})
     if tg_cfg.get("enabled") and tg_cfg.get("token"):
@@ -798,6 +823,7 @@ async def startup():
 
 def _scrape_server_traffic(server, sid, my_conns):
     server_updates = []
+    reachable = True
     try:
         ssh = get_ssh(server)
         ssh.connect()
@@ -820,7 +846,8 @@ def _scrape_server_traffic(server, sid, my_conns):
         ssh.disconnect()
     except Exception as e:
         logger.error(f"Traffic sync err server {sid}: {e}")
-    return server_updates
+        reachable = False
+    return server_updates, reachable
 
 
 async def periodic_background_tasks():
@@ -840,15 +867,35 @@ async def periodic_background_tasks():
                 conns_by_server.setdefault(sid, []).append(uc)
 
             updates = []
+            reachability_transitions: list[tuple[int, bool]] = []
 
             for sid, server in enumerate(data.get("servers", [])):
                 if sid not in conns_by_server:
                     continue
 
                 # Run the blocking SSH traffic scraping in a background thread!
-                server_updates = await asyncio.to_thread(_scrape_server_traffic, server, sid, conns_by_server[sid])
+                server_updates, reachable_now = await asyncio.to_thread(
+                    _scrape_server_traffic, server, sid, conns_by_server[sid]
+                )
                 if server_updates:
                     updates.extend(server_updates)
+                if server.get("reachable", True) != reachable_now:
+                    reachability_transitions.append((sid, reachable_now))
+
+            # Persist reachable flag and emit server.unreachable on transitions to false.
+            if reachability_transitions:
+                async with DATA_LOCK:
+                    rdata = load_data()
+                    for sid, reachable_now in reachability_transitions:
+                        if sid < len(rdata["servers"]):
+                            rdata["servers"][sid]["reachable"] = reachable_now
+                    await asyncio.to_thread(save_data, rdata)
+                for sid, reachable_now in reachability_transitions:
+                    if not reachable_now and sid < len(data["servers"]):
+                        srv = data["servers"][sid]
+                        await ext_api.fire_server_unreachable_event(
+                            srv.get("id") or str(sid), srv.get("name") or srv.get("host", "")
+                        )
 
             to_disable_uids = []
             if updates:
@@ -919,7 +966,26 @@ async def periodic_background_tasks():
                 logger.info(f"Traffic limit reached, disabling users: {to_disable_uids}")
                 await perform_mass_operations(toggle_uids=[(uid, False) for uid in to_disable_uids])
 
-            # --- 2. REMNAWAVE SYNC ---
+                # Notify external API consumers about quota exhaustion. Group by external user
+                # so each portal-side user gets a single payload with all of its connections.
+                quota_data = load_data()
+                for uid in to_disable_uids:
+                    affected_conn_ids = []
+                    affected_ext_id = None
+                    for conn in quota_data.get("user_connections", []):
+                        if conn.get("user_id") == uid and conn.get("external_user_id"):
+                            affected_ext_id = conn["external_user_id"]
+                            affected_conn_ids.append(conn["id"])
+                    if affected_ext_id and affected_conn_ids:
+                        await ext_api.fire_quota_exhausted_event(affected_ext_id, affected_conn_ids)
+
+            # --- 2. EXTERNAL-USER EXPIRY SWEEPER ---
+            try:
+                await ext_api.run_external_sweeper()
+            except Exception:
+                logger.exception("External-user sweeper failed")
+
+            # --- 3. REMNAWAVE SYNC ---
             logger.info("Starting background Remnawave sync...")
             data = load_data()
             if data.get("settings", {}).get("sync", {}).get("remnawave_sync_users"):
@@ -2353,6 +2419,42 @@ async def api_my_connection_config(request: Request, connection_id: str):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+_VERSION_CACHE: dict | None = None
+_VERSION_CACHE_AT: float = 0.0
+_VERSION_CACHE_TTL = 3600.0
+
+
+@app.get("/api/version")
+async def api_version_check(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    global _VERSION_CACHE, _VERSION_CACHE_AT
+    if _VERSION_CACHE and (time.time() - _VERSION_CACHE_AT) < _VERSION_CACHE_TTL:
+        return _VERSION_CACHE
+    if CURRENT_VERSION == "v0.0.0-dev":
+        return {"current": CURRENT_VERSION, "dev_build": True}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                "https://api.github.com/repos/PRVTPRO/Amnezia-Web-Panel/releases/latest",
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            resp.raise_for_status()
+            d = resp.json()
+        _VERSION_CACHE = {
+            "current": CURRENT_VERSION,
+            "latest": d["tag_name"],
+            "released_at": d["published_at"],
+            "notes_url": d["html_url"],
+            "up_to_date": d["tag_name"] == CURRENT_VERSION,
+        }
+        _VERSION_CACHE_AT = time.time()
+        return _VERSION_CACHE
+    except Exception:
+        logger.debug("Version check failed", exc_info=True)
+        return {"current": CURRENT_VERSION, "check_failed": True}
+
+
 @app.get("/settings")
 async def settings_page(request: Request):
     user = _check_admin(request)
@@ -2548,3 +2650,289 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         logger.exception("Error during restore")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/external_users", response_class=HTMLResponse)
+async def external_users_page(request: Request):
+    user = get_current_user(request)
+    if not user or user["role"] != "admin":
+        return RedirectResponse(url="/login", status_code=302)
+    return tpl(request, "external_users.html")
+
+
+# ======================== ADMIN UI: External users + API keys ========================
+#
+# Session-authenticated companions to /api/v1/ext. Used by the Users tab and the
+# Settings → API Keys section so an operator can manage portal-driven users
+# without needing HMAC-signed calls.
+
+
+class ExtUserAdminCreate(BaseModel):
+    external_id: str
+    expires_at: str
+    label: str | None = None
+
+
+class ExtUserAdminPatch(BaseModel):
+    expires_at: str | None = None
+    label: str | None = None
+    status: str | None = None
+
+
+class ApiKeyMintRequest(BaseModel):
+    label: str = ""
+
+
+class ApiKeyWebhookRequest(BaseModel):
+    url: str = ""
+    secret: str | None = None
+    events: list[str] = []
+
+
+@app.get("/api/admin/external_users")
+async def api_admin_list_ext_users(
+    request: Request,
+    search: str = "",
+    status: str = "",
+    page: int = 1,
+    size: int = 25,
+):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    users = data.get("external_users", [])
+    if status:
+        users = [u for u in users if u.get("status") == status]
+    if search:
+        s = search.lower()
+        users = [u for u in users if s in u["external_id"].lower() or (u.get("label") and s in u["label"].lower())]
+    total = len(users)
+    size = max(1, min(size, 200))
+    page = max(1, page)
+    start = (page - 1) * size
+    page_items = users[start : start + size]
+    conns = data.get("user_connections", [])
+    rows = [ext_api._serialize_user(u, conns) for u in page_items]
+    return {"users": rows, "total": total, "page": page, "size": size, "pages": (total + size - 1) // size}
+
+
+@app.post("/api/admin/external_users")
+async def api_admin_create_ext_user(request: Request, payload: ExtUserAdminCreate):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    if ext_api._ext_user_by_id(data, payload.external_id):
+        return JSONResponse({"error": "External user already exists"}, status_code=400)
+    try:
+        ext_api._parse_iso(payload.expires_at)
+    except ValueError:
+        return JSONResponse({"error": "expires_at must be ISO 8601"}, status_code=400)
+    now = ext_api._now_iso()
+    record = {
+        "external_id": payload.external_id,
+        "label": payload.label,
+        "expires_at": payload.expires_at,
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+        "expiring_soon_notified_at": None,
+    }
+    data["external_users"].append(record)
+    await save_data_async(data)
+    return {"status": "success", "user": ext_api._serialize_user(record, data.get("user_connections", []))}
+
+
+@app.get("/api/admin/external_users/{external_id}")
+async def api_admin_get_ext_user(request: Request, external_id: str):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    user = ext_api._ext_user_by_id(data, external_id)
+    if not user:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    summary = ext_api._serialize_user(user, data.get("user_connections", []))
+    summary["connections"] = [
+        ext_api._serialize_connection(c, data)
+        for c in data.get("user_connections", [])
+        if c.get("external_user_id") == external_id
+    ]
+    return summary
+
+
+@app.patch("/api/admin/external_users/{external_id}")
+async def api_admin_patch_ext_user(request: Request, external_id: str, payload: ExtUserAdminPatch):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    async with DATA_LOCK:
+        data = load_data()
+        user = ext_api._ext_user_by_id(data, external_id)
+        if not user:
+            return JSONResponse({"error": "User not found"}, status_code=404)
+        prev_status = user.get("status")
+        if payload.label is not None:
+            user["label"] = payload.label
+        if payload.expires_at is not None:
+            try:
+                ext_api._parse_iso(payload.expires_at)
+            except ValueError:
+                return JSONResponse({"error": "expires_at must be ISO 8601"}, status_code=400)
+            user["expires_at"] = payload.expires_at
+
+            if prev_status == "expired" and ext_api._parse_iso(payload.expires_at) > datetime.now(UTC):
+                user["status"] = "active"
+                user["expiring_soon_notified_at"] = None
+                await ext_api._re_enable_connections(data, external_id)
+        if payload.status is not None:
+            if payload.status not in ("active", "expired", "suspended"):
+                return JSONResponse({"error": "Invalid status"}, status_code=400)
+            user["status"] = payload.status
+            if payload.status == "suspended" and prev_status != "suspended":
+                await ext_api._disable_connections(data, external_id)
+        user["updated_at"] = ext_api._now_iso()
+        await asyncio.to_thread(save_data, data)
+    return {"status": "success", "user": ext_api._serialize_user(user, data.get("user_connections", []))}
+
+
+@app.delete("/api/admin/external_users/{external_id}")
+async def api_admin_delete_ext_user(request: Request, external_id: str):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    if not ext_api._ext_user_by_id(data, external_id):
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    await ext_api._cascade_delete_user(external_id)
+    return {"status": "deleted"}
+
+
+@app.get("/api/admin/api_keys")
+async def api_admin_list_keys(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    return {
+        "keys": [
+            {
+                "id": k["id"],
+                "label": k.get("label", ""),
+                "created_at": k.get("created_at"),
+                "last_used_at": k.get("last_used_at"),
+                "revoked": k.get("revoked", False),
+                "webhook": (k.get("webhook") or {}).get("url"),
+            }
+            for k in data.get("api_keys", [])
+        ]
+    }
+
+
+@app.post("/api/admin/api_keys")
+async def api_admin_mint_key(request: Request, payload: ApiKeyMintRequest):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    new_key = {
+        "id": ext_api._generate_key_id(),
+        "secret": ext_api._generate_secret(),
+        "scopes": ["full"],
+        "label": payload.label or "unnamed",
+        "created_at": ext_api._now_iso(),
+        "revoked": False,
+        "last_used_at": None,
+        "webhook": None,
+    }
+    data = load_data()
+    data["api_keys"].append(new_key)
+    await save_data_async(data)
+    # Secret returned ONCE — never again. Caller MUST store it.
+    return {"id": new_key["id"], "secret": new_key["secret"], "label": new_key["label"]}
+
+
+@app.post("/api/admin/api_keys/{key_id}/revoke")
+async def api_admin_revoke_key(request: Request, key_id: str):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    key = next((k for k in data.get("api_keys", []) if k["id"] == key_id), None)
+    if not key:
+        return JSONResponse({"error": "Key not found"}, status_code=404)
+    key["revoked"] = True
+    await save_data_async(data)
+    return {"status": "revoked"}
+
+
+@app.put("/api/admin/api_keys/{key_id}/webhook")
+async def api_admin_set_webhook(request: Request, key_id: str, payload: ApiKeyWebhookRequest):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    key = next((k for k in data.get("api_keys", []) if k["id"] == key_id), None)
+    if not key:
+        return JSONResponse({"error": "Key not found"}, status_code=404)
+    key["webhook"] = {
+        "url": payload.url,
+        "secret": payload.secret or (key.get("webhook") or {}).get("secret") or ext_api._generate_secret(),
+        "events": payload.events,
+    }
+    await save_data_async(data)
+    return {"status": "success", "webhook": key["webhook"]}
+
+
+@app.post("/api/admin/api_keys/{key_id}/test_webhook")
+async def api_admin_test_webhook(request: Request, key_id: str):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    key = next((k for k in data.get("api_keys", []) if k["id"] == key_id), None)
+    if not key or not (key.get("webhook") or {}).get("url"):
+        return JSONResponse({"error": "Webhook not configured"}, status_code=400)
+    await ext_api.enqueue_webhook(key, "test", {"message": "Test event from panel"})
+    return {"status": "queued"}
+
+
+@app.patch("/api/admin/servers/{server_id}/region")
+async def api_admin_set_region(request: Request, server_id: int, payload: dict):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    region = (payload or {}).get("region", "")
+    data = load_data()
+    if server_id >= len(data["servers"]):
+        return JSONResponse({"error": "Server not found"}, status_code=404)
+    data["servers"][server_id]["region"] = region
+    await save_data_async(data)
+    return {"status": "success", "region": region}
+
+
+@app.get("/api/admin/stats/summary")
+async def api_admin_stats_summary(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    data = load_data()
+    users = data.get("external_users", [])
+    conns = data.get("user_connections", [])
+    from collections import defaultdict as _dd
+
+    counts: dict[int, int] = _dd(int)
+    for c in conns:
+        sid = c.get("server_id")
+        if isinstance(sid, int):
+            counts[sid] += 1
+    per_server = []
+    for idx, srv in enumerate(data.get("servers", [])):
+        per_server.append(
+            {
+                "id": srv.get("id") or str(idx),
+                "label": srv.get("name") or srv.get("host"),
+                "region": srv.get("region", ""),
+                "active_connections": counts.get(idx, 0),
+                "reachable": srv.get("reachable", True),
+            }
+        )
+    return {
+        "active_users": sum(1 for u in users if u.get("status") == "active"),
+        "total_users": len(users),
+        "total_connections": len(conns),
+        "per_server": per_server,
+    }
+
+
+# Mount the public external-API router. Must be the last app.include_router so
+# all dependencies (logger, settings, secrets) are resolved.
+app.include_router(ext_api.router)

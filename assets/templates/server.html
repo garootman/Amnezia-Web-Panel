@@ -517,7 +517,7 @@
     function switchCategory(cat) {
         const grids = ['protocols-grid', 'services-grid', 'management-grid'];
         const tabs = ['tab-protocols', 'tab-services', 'tab-management'];
-        
+
         grids.forEach(g => {
             if (document.getElementById(g)) document.getElementById(g).classList.add('hidden');
         });
@@ -533,7 +533,7 @@
 
         const activeGrid = document.getElementById(cat + '-grid');
         const activeTab = document.getElementById('tab-' + cat);
-        
+
         if (activeGrid) activeGrid.classList.remove('hidden');
         if (activeTab) {
             activeTab.classList.add('active');
@@ -1105,7 +1105,7 @@
             if (isEdit && clientData) {
                 editingClientId = clientData.clientName;
                 document.getElementById('telemtQuota').value = clientData.quota || '';
-                document.getElementById('telemtMaxIps').value = ''; 
+                document.getElementById('telemtMaxIps').value = '';
                 document.getElementById('telemtExpiry').value = clientData.expiry || '';
                 document.getElementById('telemtSecret').value = clientData.token || '';
                 document.getElementById('telemtAdTag').value = clientData.user_ad_tag || '';

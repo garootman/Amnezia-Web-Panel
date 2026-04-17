@@ -14,10 +14,17 @@ COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
 
+# Trim wheel metadata and bundled test suites; keep __pycache__ (UV_COMPILE_BYTECODE=1).
+RUN find /app/.venv -name '*.dist-info' -type d -exec rm -rf {} + \
+ && find /app/.venv/lib -type d -name 'tests' -prune -exec rm -rf {} + \
+ && find /app/.venv/lib -type d -name 'test' -prune -exec rm -rf {} +
+
 FROM python:3.12-slim-bookworm
 RUN groupadd --system --gid 999 app \
  && useradd --system --gid 999 --uid 999 --create-home app
-COPY --from=builder --chown=app:app /app /app
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
+COPY --from=builder --chown=app:app /app/src /app/src
+COPY --from=builder --chown=app:app /app/assets /app/assets
 RUN mkdir -p /app/data && chown -R app:app /app/data
 ENV PATH="/app/.venv/bin:$PATH" \
     PANEL_HOST=0.0.0.0 \

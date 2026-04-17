@@ -459,12 +459,11 @@ GitHub API fails or times out → "Version check unavailable" in muted text; `lo
        registry: ghcr.io
        username: ${{ github.actor }}
        password: ${{ secrets.GITHUB_TOKEN }}
-   - uses: docker/build-push-action@v5
+   - uses: docker/build-push-action@v6
      with:
        push: true
        tags: |
-         prvtpro/amnezia-panel:${{ github.ref_name }}
-         ghcr.io/prvtpro/amnezia-panel:${{ github.ref_name }}
+         ghcr.io/garootman/amnezia-web-panel:${{ github.ref_name }}
    ```
 7. Alpine — skipped (musl wheel story for cryptography/paramiko).
 
@@ -474,7 +473,7 @@ GitHub API fails or times out → "Version check unavailable" in muted text; `lo
 - [ ] Container boots, serves `/`, passes existing healthcheck.
 - [ ] No `__pycache__` deletion in the Dockerfile.
 - [ ] Final image contains only `.venv/`, `src/`, `assets/`.
-- [ ] GHCR tag published alongside Docker Hub from the same build workflow.
+- [ ] GHCR tag published from the build workflow on pushes to `main` and version tags.
 
 ---
 

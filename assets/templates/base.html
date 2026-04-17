@@ -47,6 +47,7 @@
                 <a href="/users" class="nav-link">{{ _('nav_users') }}</a>
                 {% endif %}
                 {% if current_user.role == 'admin' %}
+                <a href="/external_users" class="nav-link">{{ _('nav_external_users') }}</a>
                 <a href="/settings" class="nav-link">{{ _('nav_settings') }}</a>
                 {% endif %}
                 <a href="/my" class="nav-link">{{ _('nav_connections') }}</a>

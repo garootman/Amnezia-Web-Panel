@@ -277,6 +277,28 @@
             </p>
         </div>
 
+        <!-- BLOCK: External API keys -->
+        <div class="card" style="margin-top: var(--space-lg);">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">🔑 {{ _('api_keys_title') }}</h3>
+            <p class="form-hint" style="margin-bottom: var(--space-md);">{{ _('api_keys_help') }}</p>
+
+            <div style="display: flex; gap: var(--space-sm); margin-bottom: var(--space-md);">
+                <input class="form-input" id="newApiKeyLabel" placeholder="{{ _('api_key_label_placeholder') }}" style="flex: 1;">
+                <button type="button" class="btn btn-primary" onclick="mintApiKey()">＋ {{ _('api_key_mint') }}</button>
+            </div>
+
+            <div id="apiKeyJustMinted" class="hidden" style="padding: var(--space-md); border-radius: var(--radius-md); background: var(--bg-primary); border: 1px solid var(--success); margin-bottom: var(--space-md);">
+                <div style="font-weight: 600; color: var(--success); margin-bottom: var(--space-sm);">{{ _('api_key_minted_warning') }}</div>
+                <div style="display:flex; gap: var(--space-sm); align-items: center;">
+                    <code id="apiKeyMintedId" style="font-family: monospace; flex-shrink: 0;"></code>
+                    <input id="apiKeyMintedSecret" readonly class="form-input" style="font-family: monospace;">
+                    <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(document.getElementById('apiKeyMintedSecret').value)">📋</button>
+                </div>
+            </div>
+
+            <div id="apiKeysList" style="display: flex; flex-direction: column; gap: var(--space-sm);"></div>
+        </div>
+
         <!-- BLOCK: About & Updates -->
         <div class="card" style="margin-top: var(--space-lg);">
             <h3 class="card-title" style="margin-bottom: var(--space-lg);">ℹ️ {{ _('about_title') }}</h3>
@@ -285,19 +307,9 @@
                     <span style="font-weight: 500;">{{ _('current_version') }}</span>
                     <span class="badge badge-info" id="currentVersionBadge" style="font-size: 0.95rem;">{{ current_version }}</span>
                 </div>
-                
-                <div id="updateStatus" class="hidden" style="padding: var(--space-md); border-radius: var(--radius-md); background: var(--bg-primary); text-align: center;">
-                    <!-- Updated via JS -->
-                </div>
 
-                <div style="display: flex; gap: var(--space-sm); margin-top: var(--space-sm);">
-                    <button type="button" class="btn btn-secondary" onclick="checkForUpdates()" id="checkUpdateBtn" style="flex:1;">
-                        <span id="checkUpdateBtnText">🔄 {{ _('check_updates') }}</span>
-                        <div class="spinner hidden" id="checkUpdateSpinner" style="width:14px; height:14px;"></div>
-                    </button>
-                    <a href="https://github.com/PRVTPRO/Amnezia-Web-Panel/releases" target="_blank" class="btn btn-primary hidden" id="downloadUpdateBtn" style="flex:1; text-decoration: none; justify-content: center;">
-                        ⬇️ {{ _('download_update') }}
-                    </a>
+                <div id="updateStatus" style="padding: var(--space-md); border-radius: var(--radius-md); background: var(--bg-primary); text-align: center; color: var(--text-muted);">
+                    {{ _('checking_updates')|default('Checking...') }}
                 </div>
             </div>
         </div>
@@ -538,45 +550,104 @@
         updateProtocolsForSync();
     }
 
-    async function checkForUpdates() {
-        const btn = document.getElementById('checkUpdateBtn');
-        const text = document.getElementById('checkUpdateBtnText');
-        const spinner = document.getElementById('checkUpdateSpinner');
-        const statusDiv = document.getElementById('updateStatus');
-        const downloadBtn = document.getElementById('downloadUpdateBtn');
-        
-        btn.disabled = true;
-        text.textContent = "{{ _('checking_updates')|default('Checking...') }}";
-        spinner.classList.remove('hidden');
-        statusDiv.classList.add('hidden');
-        downloadBtn.classList.add('hidden');
-
+    async function loadApiKeys() {
         try {
-            const response = await fetch('https://api.github.com/repos/PRVTPRO/Amnezia-Web-Panel/releases/latest');
-            if (!response.ok) throw new Error('API Error');
-            const data = await response.json();
-            
-            const latestVersion = data.tag_name;
-            const currentVersion = '{{ current_version }}';
-            
-            statusDiv.classList.remove('hidden');
-            
-            if (latestVersion !== currentVersion && latestVersion) {
-                statusDiv.innerHTML = `<span style="color: var(--success); font-weight: bold;">{{ _('update_available')|default('Update available') }}: ${latestVersion}</span>`;
-                statusDiv.style.border = '1px solid var(--success)';
-                downloadBtn.href = data.html_url;
-                downloadBtn.classList.remove('hidden');
-            } else {
-                statusDiv.innerHTML = `<span style="color: var(--text-muted);">{{ _('up_to_date')|default('Up to date') }}</span>`;
-                statusDiv.style.border = '1px solid var(--border-color)';
+            const data = await apiCall('/api/admin/api_keys');
+            const list = document.getElementById('apiKeysList');
+            if (!data.keys.length) {
+                list.innerHTML = `<div style="color: var(--text-muted); text-align: center; padding: var(--space-md);">${_('api_keys_empty')||'No API keys yet.'}</div>`;
+                return;
             }
-        } catch (err) {
-            showToast('Failed to check for updates: ' + err.message, 'error');
-        } finally {
-            btn.disabled = false;
-            text.textContent = "🔄 {{ _('check_updates')|default('Check for updates') }}";
-            spinner.classList.add('hidden');
+            list.innerHTML = data.keys.map(k => `
+                <div style="display:flex; gap: var(--space-sm); align-items: center; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-md); flex-wrap: wrap;">
+                    <code style="font-family: monospace; font-size: 0.85rem;">${k.id}</code>
+                    <span>${k.label || ''}</span>
+                    ${k.revoked ? '<span class="badge badge-warn">revoked</span>' : '<span class="badge badge-success">active</span>'}
+                    <span style="color: var(--text-muted); font-size: 0.85rem;">last used: ${k.last_used_at ? k.last_used_at.slice(0, 16).replace('T', ' ') : '—'}</span>
+                    <div style="margin-left: auto; display: flex; gap: var(--space-xs);">
+                        <button class="btn btn-secondary btn-sm" onclick="configureWebhook('${k.id}', '${k.webhook||''}')">{{ _('api_key_webhook')|default('Webhook') }}</button>
+                        ${k.webhook ? `<button class="btn btn-secondary btn-sm" onclick="testWebhook('${k.id}')">{{ _('api_key_test')|default('Test') }}</button>` : ''}
+                        ${k.revoked ? '' : `<button class="btn btn-danger btn-sm" onclick="revokeApiKey('${k.id}')">{{ _('api_key_revoke')|default('Revoke') }}</button>`}
+                    </div>
+                </div>
+            `).join('');
+        } catch (e) {
+            console.warn('Failed to load API keys', e);
         }
     }
+
+    async function mintApiKey() {
+        const label = document.getElementById('newApiKeyLabel').value.trim() || 'unnamed';
+        try {
+            const r = await apiCall('/api/admin/api_keys', 'POST', { label });
+            const box = document.getElementById('apiKeyJustMinted');
+            document.getElementById('apiKeyMintedId').textContent = r.id;
+            document.getElementById('apiKeyMintedSecret').value = r.secret;
+            box.classList.remove('hidden');
+            document.getElementById('newApiKeyLabel').value = '';
+            loadApiKeys();
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function revokeApiKey(id) {
+        if (!confirm("{{ _('api_key_revoke_confirm')|default('Revoke this key?') }}")) return;
+        try {
+            await apiCall(`/api/admin/api_keys/${encodeURIComponent(id)}/revoke`, 'POST');
+            loadApiKeys();
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function configureWebhook(id, current) {
+        const url = prompt("{{ _('api_key_webhook_url_prompt')|default('Webhook URL (empty to keep)') }}", current || '');
+        if (url === null) return;
+        const events = prompt("{{ _('api_key_webhook_events_prompt')|default('Events (comma-separated, blank=all)') }}", '');
+        if (events === null) return;
+        try {
+            const res = await fetch(`/api/admin/api_keys/${encodeURIComponent(id)}/webhook`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, events: events ? events.split(',').map(s => s.trim()).filter(Boolean) : [] })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Failed');
+            showToast('{{ _("saved")|default("Saved") }}: secret=' + (data.webhook?.secret || ''), 'success');
+            loadApiKeys();
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function testWebhook(id) {
+        try {
+            await apiCall(`/api/admin/api_keys/${encodeURIComponent(id)}/test_webhook`, 'POST');
+            showToast("{{ _('api_key_test_queued')|default('Test event queued') }}", 'success');
+        } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    document.addEventListener('DOMContentLoaded', loadApiKeys);
+
+    document.addEventListener('DOMContentLoaded', async () => {
+        const statusDiv = document.getElementById('updateStatus');
+        if (!statusDiv) return;
+        try {
+            const data = await apiCall('/api/version');
+            if (data.dev_build) {
+                statusDiv.textContent = "{{ _('version_dev_build')|default('Development build; version check skipped') }}";
+                return;
+            }
+            if (data.check_failed) {
+                statusDiv.textContent = "{{ _('version_check_failed')|default('Version check unavailable') }}";
+                return;
+            }
+            if (data.up_to_date) {
+                statusDiv.innerHTML = `<span style="color: var(--text-muted);">{{ _('up_to_date')|default('Up to date') }} (${data.latest})</span>`;
+                statusDiv.style.border = '1px solid var(--border-color)';
+            } else {
+                const noteUrl = data.notes_url ? ` <a href="${data.notes_url}" target="_blank" rel="noopener">${"{{ _('release_notes')|default('release notes') }}"}</a>` : '';
+                statusDiv.innerHTML = `<span style="color: var(--success); font-weight: bold;">{{ _('update_available')|default('Update available') }}: ${data.latest}</span>${noteUrl}`;
+                statusDiv.style.border = '1px solid var(--success)';
+            }
+        } catch (err) {
+            statusDiv.textContent = "{{ _('version_check_failed')|default('Version check unavailable') }}";
+        }
+    });
 </script>
 {% endblock %}
