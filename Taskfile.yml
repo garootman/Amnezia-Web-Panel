@@ -1,0 +1,53 @@
+version: "3"
+
+tasks:
+  dev:
+    desc: Run the panel locally with auto-reload
+    cmd: uv run uvicorn amnezia_panel.app:app --reload --host ${PANEL_HOST:-127.0.0.1} --port ${PANEL_PORT:-5000}
+
+  run:
+    desc: Run the panel via the package entrypoint (no reload)
+    cmd: uv run python -m amnezia_panel
+
+  lint:
+    desc: Lint the codebase with ruff
+    cmd: uv run ruff check
+
+  fmt:
+    desc: Format the codebase with ruff
+    cmd: uv run ruff format
+
+  fmt-check:
+    desc: Verify formatting without modifying files
+    cmd: uv run ruff format --check
+
+  audit:
+    desc: Scan resolved dependencies for known vulnerabilities (OSV)
+    cmd: uv audit --no-group dev --preview-features audit
+
+  check:
+    desc: Run every pre-push check (lint, format, audit)
+    cmds:
+      - task: lint
+      - task: fmt-check
+      - task: audit
+
+  lock:
+    desc: Refresh uv.lock without upgrading
+    cmd: uv lock
+
+  upgrade:
+    desc: Resolve the highest compatible versions and refresh uv.lock
+    cmd: uv lock --upgrade
+
+  docker-build:
+    desc: Build the local Docker image
+    cmd: docker build -t amnezia-panel:dev .
+
+  docker-run:
+    desc: Run the Docker image with the compose file
+    cmd: docker compose up --build
+
+  pre-commit-install:
+    desc: Install the git pre-commit hook
+    cmd: uvx pre-commit install

@@ -9,39 +9,37 @@ Replicates the logic from:
 """
 
 import json
-import os
-import secrets
-import struct
-import hashlib
 import logging
 import re
-from base64 import b64encode, b64decode
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+import secrets
+from base64 import b64encode
+
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 logger = logging.getLogger(__name__)
 
 # Default AWG parameters (from protocols_defs.h)
 AWG_DEFAULTS = {
-    'port': '55424',
-    'mtu': '1280',
-    'subnet_address': '10.8.1.0',
-    'subnet_cidr': '24',
-    'subnet_ip': '10.8.1.1',
-    'dns1': '1.1.1.1',
-    'dns2': '1.0.0.1',
+    "port": "55424",
+    "mtu": "1280",
+    "subnet_address": "10.8.1.0",
+    "subnet_cidr": "24",
+    "subnet_ip": "10.8.1.1",
+    "dns1": "1.1.1.1",
+    "dns2": "1.0.0.1",
     # AWG obfuscation parameters
-    'junk_packet_count': '3',
-    'junk_packet_min_size': '10',
-    'junk_packet_max_size': '30',
-    'init_packet_junk_size': '15',
-    'response_packet_junk_size': '18',
-    'cookie_reply_packet_junk_size': '20',
-    'transport_packet_junk_size': '23',
-    'init_packet_magic_header': '1020325451',
-    'response_packet_magic_header': '3288052141',
-    'transport_packet_magic_header': '2528465083',
-    'underload_packet_magic_header': '1766607858',
+    "junk_packet_count": "3",
+    "junk_packet_min_size": "10",
+    "junk_packet_max_size": "30",
+    "init_packet_junk_size": "15",
+    "response_packet_junk_size": "18",
+    "cookie_reply_packet_junk_size": "20",
+    "transport_packet_junk_size": "23",
+    "init_packet_magic_header": "1020325451",
+    "response_packet_magic_header": "3288052141",
+    "transport_packet_magic_header": "2528465083",
+    "underload_packet_magic_header": "1766607858",
 }
 
 
@@ -51,11 +49,10 @@ def generate_wg_keypair():
     private_bytes = private_key.private_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption()
+        encryption_algorithm=serialization.NoEncryption(),
     )
     public_bytes = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
     )
     return b64encode(private_bytes).decode(), b64encode(public_bytes).decode()
 
@@ -68,6 +65,7 @@ def generate_psk():
 def generate_awg_params(use_ranges=False):
     """Generate random AWG obfuscation parameters."""
     import random
+
     jc = random.randint(1, 10)
     jmin = random.randint(5, 20)
     jmax = random.randint(jmin + 10, jmin + 50)
@@ -89,17 +87,17 @@ def generate_awg_params(use_ranges=False):
         h4 = str(random.randint(100000000, 4294967295))
 
     return {
-        'junk_packet_count': str(jc),
-        'junk_packet_min_size': str(jmin),
-        'junk_packet_max_size': str(jmax),
-        'init_packet_junk_size': str(s1),
-        'response_packet_junk_size': str(s2),
-        'cookie_reply_packet_junk_size': str(s3),
-        'transport_packet_junk_size': str(s4),
-        'init_packet_magic_header': h1,
-        'response_packet_magic_header': h2,
-        'underload_packet_magic_header': h3,
-        'transport_packet_magic_header': h4,
+        "junk_packet_count": str(jc),
+        "junk_packet_min_size": str(jmin),
+        "junk_packet_max_size": str(jmax),
+        "init_packet_junk_size": str(s1),
+        "response_packet_junk_size": str(s2),
+        "cookie_reply_packet_junk_size": str(s3),
+        "transport_packet_junk_size": str(s4),
+        "init_packet_magic_header": h1,
+        "response_packet_magic_header": h2,
+        "underload_packet_magic_header": h3,
+        "transport_packet_magic_header": h4,
     }
 
 
@@ -107,9 +105,9 @@ class AWGManager:
     """Manages AmneziaWG protocol installation and client management."""
 
     # Protocol types
-    AWG = 'awg'          # New AWG (awg-go based, uses awg/awg-quick)
-    AWG_LEGACY = 'awg_legacy'  # Legacy AWG (uses wg/wg-quick)
-    AWG2 = 'awg2'        # AmneziaWG 2.0 (separate container amnezia-awg2)
+    AWG = "awg"  # New AWG (awg-go based, uses awg/awg-quick)
+    AWG_LEGACY = "awg_legacy"  # Legacy AWG (uses wg/wg-quick)
+    AWG2 = "awg2"  # AmneziaWG 2.0 (separate container amnezia-awg2)
 
     def __init__(self, ssh_manager):
         self.ssh = ssh_manager
@@ -117,50 +115,48 @@ class AWGManager:
     def _container_name(self, protocol_type):
         """Get Docker container name for protocol type."""
         if protocol_type == self.AWG_LEGACY:
-            return 'amnezia-awg-legacy'
+            return "amnezia-awg-legacy"
         if protocol_type == self.AWG2:
-            return 'amnezia-awg2'
-        return 'amnezia-awg'
+            return "amnezia-awg2"
+        return "amnezia-awg"
 
     def _config_path(self, protocol_type):
         """Get server config path inside container."""
         if protocol_type == self.AWG_LEGACY:
-            return '/opt/amnezia/awg/wg0.conf'
+            return "/opt/amnezia/awg/wg0.conf"
         # Both AWG and AWG2 use awg0.conf
-        return '/opt/amnezia/awg/awg0.conf'
+        return "/opt/amnezia/awg/awg0.conf"
 
     def _wg_binary(self, protocol_type):
         """Get the wireguard binary name."""
         if protocol_type == self.AWG_LEGACY:
-            return 'wg'
+            return "wg"
         # AWG and AWG2 both use 'awg' binary
-        return 'awg'
-
+        return "awg"
 
     def _quick_binary(self, protocol_type):
         """Get the wireguard-quick binary name."""
         if protocol_type == self.AWG_LEGACY:
-            return 'wg-quick'
+            return "wg-quick"
         # AWG and AWG2 both use 'awg-quick'
-        return 'awg-quick'
-
+        return "awg-quick"
 
     def _interface_name(self, protocol_type):
         """Get the interface name."""
         if protocol_type == self.AWG_LEGACY:
-            return 'wg0'
+            return "wg0"
         # AWG and AWG2 both use 'awg0' interface
-        return 'awg0'
+        return "awg0"
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""
         if protocol_type in (self.AWG, self.AWG2):
-            return 'amneziavpn/amneziawg-go:latest'
-        return 'amneziavpn/amnezia-wg:latest'
+            return "amneziavpn/amneziawg-go:latest"
+        return "amneziavpn/amnezia-wg:latest"
 
     def _clients_table_path(self):
         """Path to the clients table file inside container."""
-        return '/opt/amnezia/awg/clientsTable'
+        return "/opt/amnezia/awg/clientsTable"
 
     # ===================== INSTALLATION =====================
 
@@ -169,8 +165,10 @@ class AWGManager:
         out, err, code = self.ssh.run_command("docker --version 2>/dev/null")
         if code != 0:
             return False
-        out2, _, code2 = self.ssh.run_command("systemctl is-active docker 2>/dev/null || service docker status 2>/dev/null")
-        return 'active' in out2 or 'running' in out2.lower()
+        out2, _, code2 = self.ssh.run_command(
+            "systemctl is-active docker 2>/dev/null || service docker status 2>/dev/null"
+        )
+        return "active" in out2 or "running" in out2.lower()
 
     def install_docker(self):
         """Install Docker on the server (mirrors install_docker.sh)."""
@@ -205,7 +203,7 @@ docker --version
         out, _, code = self.ssh.run_sudo_command(
             f"docker ps --filter name=^{container_name}$ --format '{{{{.Status}}}}'"
         )
-        return 'Up' in out
+        return "Up" in out
 
     def check_protocol_installed(self, protocol_type):
         """Check if protocol is installed (container exists)."""
@@ -214,7 +212,7 @@ docker --version
             f"docker ps -a --filter name=^{container_name}$ --format '{{{{.Names}}}}'"
         )
         # Exact match check
-        return container_name in out.strip().split('\n')
+        return container_name in out.strip().split("\n")
 
     def prepare_host(self, protocol_type):
         """Prepare host for container (mirrors prepare_host.sh)."""
@@ -248,17 +246,13 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
                configure container -> run container -> setup firewall
         """
         if port is None:
-            port = AWG_DEFAULTS['port']
+            port = AWG_DEFAULTS["port"]
 
         if awg_params is None:
             awg_params = generate_awg_params(use_ranges=(protocol_type in (self.AWG, self.AWG2)))
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
-        config_path = self._config_path(protocol_type)
-        wg_bin = self._wg_binary(protocol_type)
-        quick_bin = self._quick_binary(protocol_type)
-        iface = self._interface_name(protocol_type)
 
         results = []
 
@@ -305,8 +299,7 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         self.ssh.upload_file_sudo(dockerfile_content, f"{dockerfile_folder}/Dockerfile")
 
         out, err, code = self.ssh.run_sudo_command(
-            f"docker build --no-cache --pull -t {container_name} {dockerfile_folder}",
-            timeout=300
+            f"docker build --no-cache --pull -t {container_name} {dockerfile_folder}", timeout=300
         )
         if code != 0:
             raise RuntimeError(f"Failed to build container: {err}")
@@ -353,23 +346,22 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         results.append("Firewall configured")
 
         return {
-            'status': 'success',
-            'protocol': protocol_type,
-            'port': port,
-            'awg_params': awg_params,
-            'log': results,
+            "status": "success",
+            "protocol": protocol_type,
+            "port": port,
+            "awg_params": awg_params,
+            "log": results,
         }
 
     def _wait_container_running(self, container_name, timeout=30):
         """Wait for a container to be in 'running' state."""
         import time
-        last_status = 'unknown'
+
+        last_status = "unknown"
         for i in range(timeout // 2):
-            out, _, _ = self.ssh.run_sudo_command(
-                f"docker inspect --format='{{{{.State.Status}}}}' {container_name}"
-            )
+            out, _, _ = self.ssh.run_sudo_command(f"docker inspect --format='{{{{.State.Status}}}}' {container_name}")
             last_status = out.strip().strip("'\"")
-            if last_status == 'running':
+            if last_status == "running":
                 logger.info(f"Container {container_name} is running")
                 time.sleep(1)
                 return True
@@ -377,12 +369,9 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             time.sleep(2)
 
         # Container failed to start — fetch logs for diagnostics
-        logs_out, _, _ = self.ssh.run_sudo_command(
-            f"docker logs --tail 50 {container_name} 2>&1"
-        )
+        logs_out, _, _ = self.ssh.run_sudo_command(f"docker logs --tail 50 {container_name} 2>&1")
         raise RuntimeError(
-            f"Container {container_name} did not start within {timeout}s "
-            f"(status: {last_status}). Logs:\n{logs_out}"
+            f"Container {container_name} did not start within {timeout}s (status: {last_status}). Logs:\n{logs_out}"
         )
 
     def _configure_container(self, protocol_type, port, awg_params):
@@ -391,8 +380,8 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         wg_bin = self._wg_binary(protocol_type)
         config_path = self._config_path(protocol_type)
 
-        subnet_ip = AWG_DEFAULTS['subnet_ip']
-        subnet_cidr = AWG_DEFAULTS['subnet_cidr']
+        subnet_ip = AWG_DEFAULTS["subnet_ip"]
+        subnet_cidr = AWG_DEFAULTS["subnet_cidr"]
 
         # Build the server config generation script
         if protocol_type in (self.AWG, self.AWG2):
@@ -413,17 +402,17 @@ cat > {config_path} <<EOF
 PrivateKey = $WIREGUARD_SERVER_PRIVATE_KEY
 Address = {subnet_ip}/{subnet_cidr}
 ListenPort = {port}
-Jc = {awg_params['junk_packet_count']}
-Jmin = {awg_params['junk_packet_min_size']}
-Jmax = {awg_params['junk_packet_max_size']}
-S1 = {awg_params['init_packet_junk_size']}
-S2 = {awg_params['response_packet_junk_size']}
-S3 = {awg_params['cookie_reply_packet_junk_size']}
-S4 = {awg_params['transport_packet_junk_size']}
-H1 = {awg_params['init_packet_magic_header']}
-H2 = {awg_params['response_packet_magic_header']}
-H3 = {awg_params['underload_packet_magic_header']}
-H4 = {awg_params['transport_packet_magic_header']}
+Jc = {awg_params["junk_packet_count"]}
+Jmin = {awg_params["junk_packet_min_size"]}
+Jmax = {awg_params["junk_packet_max_size"]}
+S1 = {awg_params["init_packet_junk_size"]}
+S2 = {awg_params["response_packet_junk_size"]}
+S3 = {awg_params["cookie_reply_packet_junk_size"]}
+S4 = {awg_params["transport_packet_junk_size"]}
+H1 = {awg_params["init_packet_magic_header"]}
+H2 = {awg_params["response_packet_magic_header"]}
+H3 = {awg_params["underload_packet_magic_header"]}
+H4 = {awg_params["transport_packet_magic_header"]}
 # Signature Chain parameters (AWG 2.0+)
 # I1 = 0
 # I2 = 0
@@ -452,21 +441,19 @@ cat > {config_path} <<EOF
 PrivateKey = $WIREGUARD_SERVER_PRIVATE_KEY
 Address = {subnet_ip}/{subnet_cidr}
 ListenPort = {port}
-Jc = {awg_params['junk_packet_count']}
-Jmin = {awg_params['junk_packet_min_size']}
-Jmax = {awg_params['junk_packet_max_size']}
-S1 = {awg_params['init_packet_junk_size']}
-S2 = {awg_params['response_packet_junk_size']}
-H1 = {awg_params['init_packet_magic_header']}
-H2 = {awg_params['response_packet_magic_header']}
-H3 = {awg_params['underload_packet_magic_header']}
-H4 = {awg_params['transport_packet_magic_header']}
+Jc = {awg_params["junk_packet_count"]}
+Jmin = {awg_params["junk_packet_min_size"]}
+Jmax = {awg_params["junk_packet_max_size"]}
+S1 = {awg_params["init_packet_junk_size"]}
+S2 = {awg_params["response_packet_junk_size"]}
+H1 = {awg_params["init_packet_magic_header"]}
+H2 = {awg_params["response_packet_magic_header"]}
+H3 = {awg_params["underload_packet_magic_header"]}
+H4 = {awg_params["transport_packet_magic_header"]}
 EOF
 """
 
-        out, err, code = self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c '{config_script}'"
-        )
+        out, err, code = self.ssh.run_sudo_command(f"docker exec -i {container_name} bash -c '{config_script}'")
         if code != 0:
             raise RuntimeError(f"Failed to configure container: {err}")
 
@@ -475,8 +462,8 @@ EOF
         container_name = self._container_name(protocol_type)
         quick_bin = self._quick_binary(protocol_type)
         config_path = self._config_path(protocol_type)
-        subnet_ip = AWG_DEFAULTS['subnet_ip']
-        subnet_cidr = AWG_DEFAULTS['subnet_cidr']
+        subnet_ip = AWG_DEFAULTS["subnet_ip"]
+        subnet_cidr = AWG_DEFAULTS["subnet_cidr"]
 
         start_script = f"""#!/bin/bash
 echo "Container startup"
@@ -514,6 +501,7 @@ tail -f /dev/null
         # Restart to apply the start script
         self.ssh.run_sudo_command(f"docker restart {container_name}")
         import time
+
         time.sleep(5)
 
     def remove_container(self, protocol_type):
@@ -545,12 +533,14 @@ tail -f /dev/null
                 # Migration from old format
                 result = []
                 for client_id, info in data.items():
-                    result.append({
-                        'clientId': client_id,
-                        'userData': {
-                            'clientName': info.get('clientName', 'Unknown'),
+                    result.append(
+                        {
+                            "clientId": client_id,
+                            "userData": {
+                                "clientName": info.get("clientName", "Unknown"),
+                            },
                         }
-                    })
+                    )
                 return result
         except json.JSONDecodeError:
             return []
@@ -563,9 +553,7 @@ tail -f /dev/null
 
         # Write to /tmp via SFTP, then docker cp into container
         self.ssh.upload_file(content, "/tmp/_amnz_clients.json")
-        self.ssh.run_sudo_command(
-            f"docker cp /tmp/_amnz_clients.json {container_name}:{clients_table_path}"
-        )
+        self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_clients.json {container_name}:{clients_table_path}")
         self.ssh.run_command("rm -f /tmp/_amnz_clients.json")
 
     def _get_server_config(self, protocol_type):
@@ -573,9 +561,7 @@ tail -f /dev/null
         container_name = self._container_name(protocol_type)
         config_path = self._config_path(protocol_type)
 
-        out, err, code = self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} cat {config_path}"
-        )
+        out, err, code = self.ssh.run_sudo_command(f"docker exec -i {container_name} cat {config_path}")
         if code != 0:
             raise RuntimeError(f"Failed to get server config: {err}")
         return out
@@ -586,7 +572,7 @@ tail -f /dev/null
         config_path = self._config_path(protocol_type)
 
         # Upload new config into container via SFTP + docker cp
-        self.ssh.upload_file(config_content.replace('\r\n', '\n'), "/tmp/_amnz_edit_config.conf")
+        self.ssh.upload_file(config_content.replace("\r\n", "\n"), "/tmp/_amnz_edit_config.conf")
         self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_edit_config.conf {container_name}:{config_path}")
         self.ssh.run_command("rm -f /tmp/_amnz_edit_config.conf")
 
@@ -619,31 +605,31 @@ tail -f /dev/null
         params = {}
         # Mapping from server config keys to our param dictionary keys
         param_map = {
-            'ListenPort': 'port',
-            'Jc': 'junk_packet_count',
-            'Jmin': 'junk_packet_min_size',
-            'Jmax': 'junk_packet_max_size',
-            'S1': 'init_packet_junk_size',
-            'S2': 'response_packet_junk_size',
-            'S3': 'cookie_reply_packet_junk_size',
-            'S4': 'transport_packet_junk_size',
-            'H1': 'init_packet_magic_header',
-            'H2': 'response_packet_magic_header',
-            'H3': 'underload_packet_magic_header',
-            'H4': 'transport_packet_magic_header',
-            'I1': 'i1',
-            'I2': 'i2',
-            'I3': 'i3',
-            'I4': 'i4',
-            'I5': 'i5',
-            'CPS': 'cps',
+            "ListenPort": "port",
+            "Jc": "junk_packet_count",
+            "Jmin": "junk_packet_min_size",
+            "Jmax": "junk_packet_max_size",
+            "S1": "init_packet_junk_size",
+            "S2": "response_packet_junk_size",
+            "S3": "cookie_reply_packet_junk_size",
+            "S4": "transport_packet_junk_size",
+            "H1": "init_packet_magic_header",
+            "H2": "response_packet_magic_header",
+            "H3": "underload_packet_magic_header",
+            "H4": "transport_packet_magic_header",
+            "I1": "i1",
+            "I2": "i2",
+            "I3": "i3",
+            "I4": "i4",
+            "I5": "i5",
+            "CPS": "cps",
         }
 
-        for line in config.split('\n'):
+        for line in config.split("\n"):
             line = line.strip()
             # Support both 'key=value' and 'key = value'
-            if '=' in line and not line.startswith('#') and not line.startswith('['):
-                parts = line.split('=', 1)
+            if "=" in line and not line.startswith("#") and not line.startswith("["):
+                parts = line.split("=", 1)
                 key = parts[0].strip()
                 val = parts[1].strip()
                 if key in param_map:
@@ -655,14 +641,10 @@ tail -f /dev/null
         """Get list of IPs already assigned in the config."""
         config = self._get_server_config(protocol_type)
         ips = []
-        for line in config.split('\n'):
+        for line in config.split("\n"):
             line = line.strip()
-            if line.startswith('AllowedIPs'):
-                match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
-                if match:
-                    ips.append(match.group(1))
-            elif line.startswith('Address'):
-                match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+            if line.startswith("AllowedIPs") or line.startswith("Address"):
+                match = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
                 if match:
                     ips.append(match.group(1))
         return ips
@@ -671,14 +653,14 @@ tail -f /dev/null
         """Calculate the next available IP for a new client."""
         used_ips = self._get_used_ips(protocol_type)
         if not used_ips:
-            base = AWG_DEFAULTS['subnet_address']
-            parts = base.split('.')
-            parts[3] = '2'
-            return '.'.join(parts)
+            base = AWG_DEFAULTS["subnet_address"]
+            parts = base.split(".")
+            parts[3] = "2"
+            return ".".join(parts)
 
         # Get the last used IP and increment
         last_ip = used_ips[-1]
-        parts = last_ip.split('.')
+        parts = last_ip.split(".")
         last_octet = int(parts[3])
 
         if last_octet == 254:
@@ -689,7 +671,7 @@ tail -f /dev/null
             next_octet = last_octet + 1
 
         parts[3] = str(next_octet)
-        return '.'.join(parts)
+        return ".".join(parts)
 
     def _parse_peers_from_config(self, protocol_type):
         """Parse [Peer] sections from WireGuard server config and return dict of pubkey -> {allowedIps}."""
@@ -700,15 +682,15 @@ tail -f /dev/null
 
         peers = {}
         current_key = None
-        for line in config.split('\n'):
+        for line in config.split("\n"):
             line = line.strip()
-            if line == '[Peer]':
+            if line == "[Peer]":
                 current_key = None
-            elif current_key is None and line.startswith('PublicKey'):
-                current_key = line.split('=', 1)[1].strip()
-                peers[current_key] = {'allowedIps': ''}
-            elif current_key and line.startswith('AllowedIPs'):
-                peers[current_key]['allowedIps'] = line.split('=', 1)[1].strip()
+            elif current_key is None and line.startswith("PublicKey"):
+                current_key = line.split("=", 1)[1].strip()
+                peers[current_key] = {"allowedIps": ""}
+            elif current_key and line.startswith("AllowedIPs"):
+                peers[current_key]["allowedIps"] = line.split("=", 1)[1].strip()
         return peers
 
     def get_clients(self, protocol_type):
@@ -724,18 +706,18 @@ tail -f /dev/null
         # Enrich clients table with wg show data
         known_ids = set()
         for client in clients_table:
-            client_id = client.get('clientId', '')
+            client_id = client.get("clientId", "")
             known_ids.add(client_id)
             if client_id in wg_show_data:
                 show_data = wg_show_data[client_id]
-                user_data = client.get('userData', {})
-                user_data['latestHandshake'] = show_data.get('latestHandshake', '')
-                user_data['dataReceived'] = show_data.get('dataReceived', '')
-                user_data['dataSent'] = show_data.get('dataSent', '')
-                user_data['dataReceivedBytes'] = show_data.get('dataReceivedBytes', 0)
-                user_data['dataSentBytes'] = show_data.get('dataSentBytes', 0)
-                user_data['allowedIps'] = show_data.get('allowedIps', '')
-                client['userData'] = user_data
+                user_data = client.get("userData", {})
+                user_data["latestHandshake"] = show_data.get("latestHandshake", "")
+                user_data["dataReceived"] = show_data.get("dataReceived", "")
+                user_data["dataSent"] = show_data.get("dataSent", "")
+                user_data["dataReceivedBytes"] = show_data.get("dataReceivedBytes", 0)
+                user_data["dataSentBytes"] = show_data.get("dataSentBytes", 0)
+                user_data["allowedIps"] = show_data.get("allowedIps", "")
+                client["userData"] = user_data
 
         # Pick up peers from conf that are NOT in clientsTable (created via native Amnezia app)
         try:
@@ -745,31 +727,34 @@ tail -f /dev/null
                     continue  # already in table
                 show_data = wg_show_data.get(pub_key, {})
                 # Derive display name from AllowedIPs (e.g. 10.8.1.5/32 -> peer-10.8.1.5)
-                allowed_ip = peer_info.get('allowedIps', '') or show_data.get('allowedIps', '')
-                ip_part = ''
+                allowed_ip = peer_info.get("allowedIps", "") or show_data.get("allowedIps", "")
+                ip_part = ""
                 if allowed_ip:
                     import re as _re
-                    m = _re.search(r'(\d+\.\d+\.\d+\.\d+)', allowed_ip)
+
+                    m = _re.search(r"(\d+\.\d+\.\d+\.\d+)", allowed_ip)
                     if m:
                         ip_part = m.group(1)
-                display_name = f'External ({ip_part})' if ip_part else 'External (native app)'
-                clients_table.append({
-                    'clientId': pub_key,
-                    'userData': {
-                        'clientName': display_name,
-                        'clientPrivateKey': '',   # not available
-                        'externalClient': True,
-                        'clientIp': ip_part,
-                        'latestHandshake': show_data.get('latestHandshake', ''),
-                        'dataReceived': show_data.get('dataReceived', ''),
-                        'dataSent': show_data.get('dataSent', ''),
-                        'dataReceivedBytes': show_data.get('dataReceivedBytes', 0),
-                        'dataSentBytes': show_data.get('dataSentBytes', 0),
-                        'allowedIps': allowed_ip,
+                display_name = f"External ({ip_part})" if ip_part else "External (native app)"
+                clients_table.append(
+                    {
+                        "clientId": pub_key,
+                        "userData": {
+                            "clientName": display_name,
+                            "clientPrivateKey": "",  # not available
+                            "externalClient": True,
+                            "clientIp": ip_part,
+                            "latestHandshake": show_data.get("latestHandshake", ""),
+                            "dataReceived": show_data.get("dataReceived", ""),
+                            "dataSent": show_data.get("dataSent", ""),
+                            "dataReceivedBytes": show_data.get("dataReceivedBytes", 0),
+                            "dataSentBytes": show_data.get("dataSentBytes", 0),
+                            "allowedIps": allowed_ip,
+                        },
                     }
-                })
+                )
         except Exception as e:
-            logger.warning(f'get_clients: failed to parse conf peers: {e}')
+            logger.warning(f"get_clients: failed to parse conf peers: {e}")
 
         return clients_table
 
@@ -777,9 +762,10 @@ tail -f /dev/null
         """Parse human readable size string like '1.50 MiB' into bytes."""
         try:
             parts = size_str.strip().split()
-            if len(parts) != 2: return 0
+            if len(parts) != 2:
+                return 0
             val, unit = float(parts[0]), parts[1]
-            units = {'B': 1, 'KiB': 1024, 'MiB': 1024**2, 'GiB': 1024**3, 'TiB': 1024**4}
+            units = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
             return int(val * units.get(unit, 1))
         except Exception:
             return 0
@@ -789,37 +775,35 @@ tail -f /dev/null
         container_name = self._container_name(protocol_type)
         wg_bin = self._wg_binary(protocol_type)
 
-        out, err, code = self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c '{wg_bin} show all'"
-        )
+        out, err, code = self.ssh.run_sudo_command(f"docker exec -i {container_name} bash -c '{wg_bin} show all'")
         if code != 0 or not out.strip():
             return {}
 
         result = {}
         current_peer = None
 
-        for line in out.split('\n'):
+        for line in out.split("\n"):
             line = line.strip()
-            if line.startswith('peer:'):
-                current_peer = line.split(':', 1)[1].strip()
+            if line.startswith("peer:"):
+                current_peer = line.split(":", 1)[1].strip()
                 result[current_peer] = {}
-            elif current_peer and ':' in line:
-                key, value = line.split(':', 1)
+            elif current_peer and ":" in line:
+                key, value = line.split(":", 1)
                 key = key.strip()
                 value = value.strip()
-                if key == 'latest handshake':
-                    result[current_peer]['latestHandshake'] = value
-                elif key == 'transfer':
-                    parts = value.split(',')
+                if key == "latest handshake":
+                    result[current_peer]["latestHandshake"] = value
+                elif key == "transfer":
+                    parts = value.split(",")
                     if len(parts) == 2:
-                        received = parts[0].strip().replace(' received', '')
-                        sent = parts[1].strip().replace(' sent', '')
-                        result[current_peer]['dataReceived'] = received
-                        result[current_peer]['dataSent'] = sent
-                        result[current_peer]['dataReceivedBytes'] = self._parse_bytes(received)
-                        result[current_peer]['dataSentBytes'] = self._parse_bytes(sent)
-                elif key == 'allowed ips':
-                    result[current_peer]['allowedIps'] = value
+                        received = parts[0].strip().replace(" received", "")
+                        sent = parts[1].strip().replace(" sent", "")
+                        result[current_peer]["dataReceived"] = received
+                        result[current_peer]["dataSent"] = sent
+                        result[current_peer]["dataReceivedBytes"] = self._parse_bytes(received)
+                        result[current_peer]["dataSentBytes"] = self._parse_bytes(sent)
+                elif key == "allowed ips":
+                    result[current_peer]["allowedIps"] = value
 
         return result
 
@@ -856,9 +840,7 @@ AllowedIPs = {client_ip}/32
 """
         # Append peer to server config
         escaped_peer = peer_section.replace("'", "'\\''")
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'"
-        )
+        self.ssh.run_sudo_command(f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'")
 
         # Sync config without restart
         self.ssh.run_sudo_command(
@@ -868,66 +850,69 @@ AllowedIPs = {client_ip}/32
         # Update clients table — store keys for config reconstruction
         clients_table = self._get_clients_table(protocol_type)
         new_client = {
-            'clientId': client_pub_key,
-            'userData': {
-                'clientName': client_name,
-                'creationDate': __import__('datetime').datetime.now().isoformat(),
-                'clientPrivateKey': client_priv_key,
-                'clientIp': client_ip,
-                'psk': psk,
-                'enabled': True,
-            }
+            "clientId": client_pub_key,
+            "userData": {
+                "clientName": client_name,
+                "creationDate": __import__("datetime").datetime.now().isoformat(),
+                "clientPrivateKey": client_priv_key,
+                "clientIp": client_ip,
+                "psk": psk,
+                "enabled": True,
+            },
         }
         clients_table.append(new_client)
         self._save_clients_table(protocol_type, clients_table)
 
         # Build client config
         awg_params = self._get_awg_params_from_config(protocol_type)
-        if awg_params.get('port'):
-            port = awg_params['port']
+        if awg_params.get("port"):
+            port = awg_params["port"]
 
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        mtu = AWG_DEFAULTS['mtu']
+        dns1 = AWG_DEFAULTS["dns1"]
+        dns2 = AWG_DEFAULTS["dns2"]
+        mtu = AWG_DEFAULTS["mtu"]
 
         # Standard fields
         config_lines = [
             f"Address = {client_ip}/32",
             f"DNS = {dns1}, {dns2}",
             f"PrivateKey = {client_priv_key}",
-            f"MTU = {mtu}"
+            f"MTU = {mtu}",
         ]
 
         # Conditional obfuscation fields
         mapping = [
-            ('junk_packet_count', 'Jc'),
-            ('junk_packet_min_size', 'Jmin'),
-            ('junk_packet_max_size', 'Jmax'),
-            ('init_packet_junk_size', 'S1'),
-            ('response_packet_junk_size', 'S2'),
-            ('cookie_reply_packet_junk_size', 'S3'),
-            ('transport_packet_junk_size', 'S4'),
-            ('init_packet_magic_header', 'H1'),
-            ('response_packet_magic_header', 'H2'),
-            ('underload_packet_magic_header', 'H3'),
-            ('transport_packet_magic_header', 'H4'),
-            ('i1', 'I1'),
-            ('i2', 'I2'),
-            ('i3', 'I3'),
-            ('i4', 'I4'),
-            ('i5', 'I5'),
-            ('cps', 'CPS')
+            ("junk_packet_count", "Jc"),
+            ("junk_packet_min_size", "Jmin"),
+            ("junk_packet_max_size", "Jmax"),
+            ("init_packet_junk_size", "S1"),
+            ("response_packet_junk_size", "S2"),
+            ("cookie_reply_packet_junk_size", "S3"),
+            ("transport_packet_junk_size", "S4"),
+            ("init_packet_magic_header", "H1"),
+            ("response_packet_magic_header", "H2"),
+            ("underload_packet_magic_header", "H3"),
+            ("transport_packet_magic_header", "H4"),
+            ("i1", "I1"),
+            ("i2", "I2"),
+            ("i3", "I3"),
+            ("i4", "I4"),
+            ("i5", "I5"),
+            ("cps", "CPS"),
         ]
 
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if protocol_type == self.AWG_LEGACY and config_key in ("S3", "S4", "I1", "I2", "I3", "I4", "I5", "CPS"):
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
-        client_config = "[Interface]\n" + "\n".join(config_lines) + f"""
+        client_config = (
+            "[Interface]\n"
+            + "\n".join(config_lines)
+            + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
@@ -936,12 +921,13 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = {server_host}:{port}
 PersistentKeepalive = 25
 """
+        )
 
         return {
-            'client_name': client_name,
-            'client_id': client_pub_key,
-            'client_ip': client_ip,
-            'config': client_config,
+            "client_name": client_name,
+            "client_id": client_pub_key,
+            "client_ip": client_ip,
+            "config": client_config,
         }
 
     def get_client_config(self, protocol_type, client_id, server_host, port):
@@ -949,17 +935,17 @@ PersistentKeepalive = 25
         clients_table = self._get_clients_table(protocol_type)
         client = None
         for c in clients_table:
-            if c.get('clientId') == client_id:
+            if c.get("clientId") == client_id:
                 client = c
                 break
 
         if not client:
             raise RuntimeError(f"Client {client_id} not found")
 
-        ud = client.get('userData', {})
-        client_priv_key = ud.get('clientPrivateKey', '')
-        client_ip = ud.get('clientIp', '')
-        psk = ud.get('psk', '')
+        ud = client.get("userData", {})
+        client_priv_key = ud.get("clientPrivateKey", "")
+        client_ip = ud.get("clientIp", "")
+        psk = ud.get("psk", "")
 
         if not client_priv_key:
             raise RuntimeError("Client private key not stored. Config cannot be reconstructed.")
@@ -969,51 +955,54 @@ PersistentKeepalive = 25
             psk = self._get_server_psk(protocol_type)
 
         awg_params = self._get_awg_params_from_config(protocol_type)
-        if awg_params.get('port'):
-            port = awg_params['port']
+        if awg_params.get("port"):
+            port = awg_params["port"]
 
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        mtu = AWG_DEFAULTS['mtu']
+        dns1 = AWG_DEFAULTS["dns1"]
+        dns2 = AWG_DEFAULTS["dns2"]
+        mtu = AWG_DEFAULTS["mtu"]
 
         # Standard fields
         config_lines = [
             f"Address = {client_ip}/32",
             f"DNS = {dns1}, {dns2}",
             f"PrivateKey = {client_priv_key}",
-            f"MTU = {mtu}"
+            f"MTU = {mtu}",
         ]
 
         # Conditional obfuscation fields
         mapping = [
-            ('junk_packet_count', 'Jc'),
-            ('junk_packet_min_size', 'Jmin'),
-            ('junk_packet_max_size', 'Jmax'),
-            ('init_packet_junk_size', 'S1'),
-            ('response_packet_junk_size', 'S2'),
-            ('cookie_reply_packet_junk_size', 'S3'),
-            ('transport_packet_junk_size', 'S4'),
-            ('init_packet_magic_header', 'H1'),
-            ('response_packet_magic_header', 'H2'),
-            ('underload_packet_magic_header', 'H3'),
-            ('transport_packet_magic_header', 'H4'),
-            ('i1', 'I1'),
-            ('i2', 'I2'),
-            ('i3', 'I3'),
-            ('i4', 'I4'),
-            ('i5', 'I5'),
-            ('cps', 'CPS')
+            ("junk_packet_count", "Jc"),
+            ("junk_packet_min_size", "Jmin"),
+            ("junk_packet_max_size", "Jmax"),
+            ("init_packet_junk_size", "S1"),
+            ("response_packet_junk_size", "S2"),
+            ("cookie_reply_packet_junk_size", "S3"),
+            ("transport_packet_junk_size", "S4"),
+            ("init_packet_magic_header", "H1"),
+            ("response_packet_magic_header", "H2"),
+            ("underload_packet_magic_header", "H3"),
+            ("transport_packet_magic_header", "H4"),
+            ("i1", "I1"),
+            ("i2", "I2"),
+            ("i3", "I3"),
+            ("i4", "I4"),
+            ("i5", "I5"),
+            ("cps", "CPS"),
         ]
 
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if protocol_type == self.AWG_LEGACY and config_key in ("S3", "S4", "I1", "I2", "I3", "I4", "I5", "CPS"):
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
-        config = "[Interface]\n" + "\n".join(config_lines) + f"""
+        config = (
+            "[Interface]\n"
+            + "\n".join(config_lines)
+            + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
@@ -1022,6 +1011,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = {server_host}:{port}
 PersistentKeepalive = 25
 """
+        )
         return config
 
     def toggle_client(self, protocol_type, client_id, enable):
@@ -1036,15 +1026,15 @@ PersistentKeepalive = 25
             clients_table = self._get_clients_table(protocol_type)
             client = None
             for c in clients_table:
-                if c.get('clientId') == client_id:
+                if c.get("clientId") == client_id:
                     client = c
                     break
             if not client:
                 raise RuntimeError(f"Client {client_id} not found")
 
-            ud = client.get('userData', {})
-            psk = ud.get('psk', '')
-            client_ip = ud.get('clientIp', '')
+            ud = client.get("userData", {})
+            psk = ud.get("psk", "")
+            client_ip = ud.get("clientIp", "")
 
             if not psk:
                 psk = self._get_server_psk(protocol_type)
@@ -1063,7 +1053,7 @@ AllowedIPs = {client_ip}/32
         else:
             # Remove peer from server config
             config = self._get_server_config(protocol_type)
-            sections = config.split('[')
+            sections = config.split("[")
             new_sections = []
             for section in sections:
                 if not section.strip():
@@ -1072,11 +1062,9 @@ AllowedIPs = {client_ip}/32
                     continue
                 new_sections.append(section)
 
-            new_config = '[' + '['.join(new_sections)
+            new_config = "[" + "[".join(new_sections)
             self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
-            self.ssh.run_sudo_command(
-                f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
-            )
+            self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}")
             self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
 
         # Sync config
@@ -1087,8 +1075,8 @@ AllowedIPs = {client_ip}/32
         # Update enabled status in clients table
         clients_table = self._get_clients_table(protocol_type)
         for c in clients_table:
-            if c.get('clientId') == client_id:
-                c.setdefault('userData', {})['enabled'] = enable
+            if c.get("clientId") == client_id:
+                c.setdefault("userData", {})["enabled"] = enable
                 break
         self._save_clients_table(protocol_type, clients_table)
 
@@ -1103,7 +1091,7 @@ AllowedIPs = {client_ip}/32
         config = self._get_server_config(protocol_type)
 
         # Split by [Peer] sections and remove the matching one
-        sections = config.split('[')
+        sections = config.split("[")
         new_sections = []
         for section in sections:
             if not section.strip():
@@ -1112,13 +1100,11 @@ AllowedIPs = {client_ip}/32
                 continue
             new_sections.append(section)
 
-        new_config = '[' + '['.join(new_sections)
+        new_config = "[" + "[".join(new_sections)
 
         # Upload new config into container via SFTP + docker cp
         self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
-        self.ssh.run_sudo_command(
-            f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
-        )
+        self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}")
         self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
 
         # Sync config
@@ -1128,35 +1114,33 @@ AllowedIPs = {client_ip}/32
 
         # Update clients table
         clients_table = self._get_clients_table(protocol_type)
-        clients_table = [c for c in clients_table if c.get('clientId') != client_id]
+        clients_table = [c for c in clients_table if c.get("clientId") != client_id]
         self._save_clients_table(protocol_type, clients_table)
 
         return True
 
     def get_server_status(self, protocol_type):
         """Get detailed status of the AWG server."""
-        container_name = self._container_name(protocol_type)
-
         info = {
-            'container_exists': self.check_protocol_installed(protocol_type),
-            'container_running': False,
-            'protocol': protocol_type,
+            "container_exists": self.check_protocol_installed(protocol_type),
+            "container_running": False,
+            "protocol": protocol_type,
         }
 
-        if info['container_exists']:
-            info['container_running'] = self.check_container_running(protocol_type)
+        if info["container_exists"]:
+            info["container_running"] = self.check_container_running(protocol_type)
 
-            if info['container_running']:
+            if info["container_running"]:
                 try:
                     config = self._get_server_config(protocol_type)
                     # Extract port
-                    for line in config.split('\n'):
-                        if 'ListenPort' in line:
-                            info['port'] = line.split('=')[1].strip()
+                    for line in config.split("\n"):
+                        if "ListenPort" in line:
+                            info["port"] = line.split("=")[1].strip()
                             break
-                    info['awg_params'] = self._get_awg_params_from_config(protocol_type)
-                    info['clients_count'] = len(self._get_clients_table(protocol_type))
+                    info["awg_params"] = self._get_awg_params_from_config(protocol_type)
+                    info["clients_count"] = len(self._get_clients_table(protocol_type))
                 except Exception as e:
-                    info['error'] = str(e)
+                    info["error"] = str(e)
 
         return info

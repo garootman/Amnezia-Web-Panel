@@ -3,9 +3,10 @@ Telegram bot for Amnezia Web Panel.
 Uses raw Telegram Bot API via httpx — no library version conflicts.
 Runs as a background asyncio task alongside the FastAPI app.
 """
+
 import asyncio
 import logging
-from typing import Optional, Callable
+from collections.abc import Callable
 
 import httpx
 
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------- #
 #  Global state
 # ----------------------------------------------------------------------- #
-_bot_task: Optional[asyncio.Task] = None
+_bot_task: asyncio.Task | None = None
 
 
 def is_running() -> bool:
@@ -67,13 +68,15 @@ class TelegramAPI:
 
     async def send_message(self, chat_id, text: str, reply_markup=None, parse_mode="HTML") -> dict:
         import json
+
         params = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
         if reply_markup:
             params["reply_markup"] = json.dumps(reply_markup)
-        return (await self.call("sendMessage", **params))
+        return await self.call("sendMessage", **params)
 
     async def edit_message(self, chat_id, message_id, text: str, reply_markup=None, parse_mode="HTML"):
         import json
+
         params = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
         if reply_markup:
             params["reply_markup"] = json.dumps(reply_markup)
@@ -181,7 +184,8 @@ async def _handle_refresh(
         return
     kb = _build_connections_keyboard(conns, data)
     await api.edit_message(
-        chat_id, message_id,
+        chat_id,
+        message_id,
         f"<b>Your connections</b> ({len(conns)}) — tap to get config:",
         reply_markup=kb,
     )
@@ -209,8 +213,7 @@ async def _handle_get_config(
 
     data = load_data_fn()
     conn = next(
-        (c for c in data.get("user_connections", [])
-         if c["id"] == conn_id and c["user_id"] == panel_user["id"]),
+        (c for c in data.get("user_connections", []) if c["id"] == conn_id and c["user_id"] == panel_user["id"]),
         None,
     )
     if not conn:
@@ -232,9 +235,9 @@ async def _handle_get_config(
     loading_msg_id = loading_result.get("result", {}).get("message_id")
 
     try:
-        from .ssh_manager import SSHManager
         from .protocols.awg import AWGManager
         from .protocols.xray import XrayManager
+        from .ssh_manager import SSHManager
 
         ssh = SSHManager(
             server["host"],
@@ -274,9 +277,7 @@ async def _handle_get_config(
         server_name = server.get("name") or server.get("host", "Unknown")
         await api.send_message(
             chat_id,
-            f"✅ <b>{conn_name}</b>\n"
-            f"🌐 Server: <b>{server_name}</b>\n"
-            f"🔌 Protocol: <b>{proto.upper()}</b>",
+            f"✅ <b>{conn_name}</b>\n🌐 Server: <b>{server_name}</b>\n🔌 Protocol: <b>{proto.upper()}</b>",
         )
 
         # ------- 2. Config as code (split by 4096 chars if huge) -------
@@ -284,9 +285,11 @@ async def _handle_get_config(
         if len(config) <= MAX_LEN:
             await api.send_message(chat_id, f"<b>📄 Configuration:</b>\n<pre>{config}</pre>")
         else:
-            chunks = [config[i:i+MAX_LEN] for i in range(0, len(config), MAX_LEN)]
+            chunks = [config[i : i + MAX_LEN] for i in range(0, len(config), MAX_LEN)]
             for i, chunk in enumerate(chunks, 1):
-                await api.send_message(chat_id, f"<b>📄 Configuration (part {i}/{len(chunks)}):</b>\n<pre>{chunk}</pre>")
+                await api.send_message(
+                    chat_id, f"<b>📄 Configuration (part {i}/{len(chunks)}):</b>\n<pre>{chunk}</pre>"
+                )
 
         # ------- 3. VPN link (if available) -------
         if vpn_link:
@@ -374,6 +377,5 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         elif data_str.startswith("cfg:"):
             conn_id = data_str[4:]
             await _handle_get_config(
-                api, chat_id, message_id, callback_id,
-                conn_id, tg_id, load_data_fn, generate_vpn_link_fn
+                api, chat_id, message_id, callback_id, conn_id, tg_id, load_data_fn, generate_vpn_link_fn
             )

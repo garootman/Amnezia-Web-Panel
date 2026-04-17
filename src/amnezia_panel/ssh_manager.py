@@ -3,10 +3,10 @@ SSH Manager - manages SSH connections to VPN servers.
 Replicates the ServerController logic from the AmneziaVPN client.
 """
 
-import paramiko
 import io
-import time
 import logging
+
+import paramiko
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class SSHManager:
         self.password = password
         self.private_key = private_key
         self.client = None
-        self._is_root = (username == 'root')
+        self._is_root = username == "root"
 
     def connect(self):
         """Establish SSH connection to the server."""
@@ -29,12 +29,12 @@ class SSHManager:
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         kwargs = {
-            'hostname': self.host,
-            'port': self.port,
-            'username': self.username,
-            'timeout': 15,
-            'allow_agent': False,
-            'look_for_keys': False,
+            "hostname": self.host,
+            "port": self.port,
+            "username": self.username,
+            "timeout": 15,
+            "allow_agent": False,
+            "look_for_keys": False,
         }
 
         if self.private_key:
@@ -48,9 +48,9 @@ class SSHManager:
                 except paramiko.ssh_exception.SSHException:
                     key_file.seek(0)
                     pkey = paramiko.ECDSAKey.from_private_key(key_file)
-            kwargs['pkey'] = pkey
+            kwargs["pkey"] = pkey
         elif self.password:
-            kwargs['password'] = self.password
+            kwargs["password"] = self.password
 
         self.client.connect(**kwargs)
         return True
@@ -68,15 +68,15 @@ class SSHManager:
 
         logger.info(f"Running command: {command[:100]}...")
         stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
-        
+
         # Crucial: set timeout on the channel to prevent hanging indefinitely
         stdout.channel.settimeout(timeout)
         stderr.channel.settimeout(timeout)
-        
+
         try:
             exit_code = stdout.channel.recv_exit_status()
-            out = stdout.read().decode('utf-8', errors='replace').strip()
-            err = stderr.read().decode('utf-8', errors='replace').strip()
+            out = stdout.read().decode("utf-8", errors="replace").strip()
+            err = stderr.read().decode("utf-8", errors="replace").strip()
         except Exception as e:
             logger.error(f"Command timed out or failed to read: {e}")
             out, err, exit_code = "", str(e), -1
@@ -89,12 +89,12 @@ class SSHManager:
     def _sudo_prefix(self):
         """Get the sudo command prefix with password handling."""
         if self._is_root:
-            return ''
+            return ""
         if self.password:
             # Use sudo -S to read password from stdin
             escaped_pass = self.password.replace("'", "'\\''")
             return f"echo '{escaped_pass}' | sudo -S "
-        return 'sudo '
+        return "sudo "
 
     def run_sudo_command(self, command, timeout=60):
         """
@@ -104,7 +104,7 @@ class SSHManager:
         """
         # Remove existing sudo prefix if present
         clean_cmd = command
-        if clean_cmd.strip().startswith('sudo '):
+        if clean_cmd.strip().startswith("sudo "):
             clean_cmd = clean_cmd.strip()[5:]
 
         if self._is_root:
@@ -130,6 +130,7 @@ class SSHManager:
 
         # Write script to temp file via SFTP (avoids heredoc/pipe conflicts)
         import hashlib
+
         script_hash = hashlib.md5(script.encode()).hexdigest()[:8]
         tmp_script = f"/tmp/_amnz_script_{script_hash}.sh"
         self.upload_file(script, tmp_script)
@@ -153,11 +154,11 @@ class SSHManager:
             raise ConnectionError("Not connected to server")
 
         # Normalize line endings (Windows CRLF -> Unix LF)
-        content = content.replace('\r\n', '\n')
+        content = content.replace("\r\n", "\n")
 
         sftp = self.client.open_sftp()
         try:
-            with sftp.file(remote_path, 'w') as f:
+            with sftp.file(remote_path, "w") as f:
                 f.write(content)
         finally:
             sftp.close()
@@ -172,10 +173,11 @@ class SSHManager:
             raise ConnectionError("Not connected to server")
 
         # Normalize line endings (Windows CRLF -> Unix LF)
-        content = content.replace('\r\n', '\n')
+        content = content.replace("\r\n", "\n")
 
         # Write to temp file via SFTP (no sudo needed for /tmp)
         import hashlib
+
         tmp_name = f"/tmp/_amnz_{hashlib.md5(remote_path.encode()).hexdigest()[:8]}"
         self.upload_file(content, tmp_name)
 
@@ -191,8 +193,8 @@ class SSHManager:
 
         sftp = self.client.open_sftp()
         try:
-            with sftp.file(remote_path, 'r') as f:
-                return f.read().decode('utf-8', errors='replace')
+            with sftp.file(remote_path, "r") as f:
+                return f.read().decode("utf-8", errors="replace")
         finally:
             sftp.close()
 

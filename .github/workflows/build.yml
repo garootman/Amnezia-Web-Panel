@@ -4,6 +4,8 @@ on:
   push:
     branches: ["main"]
     tags: ["v*"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -15,7 +17,39 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # `uv audit` shipped in 0.11. Pin so we fail loud if the action ever downgrades.
+          version: ">=0.11"
+          enable-cache: true
+
+      - name: Scan dependencies for known vulnerabilities
+        # Hits the OSV database for every resolved package (runtime deps only — no dev tools).
+        # Fails the job on any known vuln — bump the dep, or add an exception under
+        # [tool.uv.audit] ignore / ignore-until-fixed in pyproject.toml.
+        run: uv audit --no-group dev --preview-features audit
+
   build:
+    needs: [lint, audit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,11 +77,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Publish to GHCR — disabled for now. Remove `if: false` to enable.
   publish:
     needs: build
     runs-on: ubuntu-latest
-    if: false
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
 

@@ -9,14 +9,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 def _base_dir() -> Path:
     """Repo root when running from source; extracted bundle root when frozen."""
-    if getattr(sys, 'frozen', False):
-        return Path(getattr(sys, '_MEIPASS', os.path.dirname(sys.executable)))
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
     return Path(__file__).resolve().parents[2]
 
 
 def _application_path() -> Path:
     """Where runtime state (data.json default) lives when DATA_DIR is unset."""
-    if getattr(sys, 'frozen', False):
+    if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return _base_dir()
 
