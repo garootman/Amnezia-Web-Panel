@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import hashlib
 import hmac
 import io
@@ -22,7 +23,7 @@ from multicolorcaptcha import CaptchaGenerator
 from pydantic import BaseModel, field_validator
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import telegram_bot as tg_bot
+from . import secrets_store, telegram_bot as tg_bot
 from .config import settings
 from .protocols.awg import AWGManager
 from .protocols.wireguard import WireGuardManager
@@ -125,15 +126,19 @@ def load_data():
             },
         },
     )
+    secrets_store.decrypt_in_place(data)
     return data
 
 
 def save_data(data):
+    # Serialize an encrypted copy so the caller's in-memory dict keeps plaintext.
+    to_write = copy.deepcopy(data)
+    secrets_store.encrypt_in_place(to_write)
     dir_ = os.path.dirname(DATA_FILE) or "."
     fd, tmp = tempfile.mkstemp(prefix=".data.", suffix=".tmp", dir=dir_)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(to_write, f, indent=2, ensure_ascii=False)
         os.replace(tmp, DATA_FILE)
     except Exception:
         try:
@@ -756,8 +761,11 @@ def _apply_schema_migrations(data: dict) -> bool:
 
 @app.on_event("startup")
 async def startup():
+    needs_secrets_migration = secrets_store.has_plaintext_secrets_on_disk()
     data = load_data()
-    changed = False
+    changed = needs_secrets_migration
+    if needs_secrets_migration:
+        logger.info("Encrypting credential fields in data.json at rest")
     if not data.get("users"):
         data["users"] = [
             {

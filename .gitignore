@@ -30,6 +30,7 @@ coverage.xml
 
 # User data
 data.json
+data.key
 /data/
 ssl_temp/
 .env
