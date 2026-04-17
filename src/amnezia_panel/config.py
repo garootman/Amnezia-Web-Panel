@@ -3,7 +3,7 @@ import secrets
 import sys
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,13 +22,27 @@ def _application_path() -> Path:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # env_file is resolved relative to the repo root so `amnezia-panel` works from any CWD.
+    # In Docker the file won't exist (we don't COPY it in); pydantic-settings silently falls back to the
+    # process environment, which is exactly what docker compose provides via its `environment:` block.
+    model_config = SettingsConfigDict(
+        env_file=_base_dir() / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     panel_host: str = "0.0.0.0"
     panel_port: int = 5000
     secret_key: str = Field(default_factory=lambda: secrets.token_hex(32))
     data_dir: Path = Field(default_factory=_application_path)
     assets_dir: Path = Field(default_factory=lambda: _base_dir() / "assets")
+
+    @field_validator("secret_key", mode="before")
+    @classmethod
+    def _regenerate_if_blank(cls, v: str | None) -> str:
+        # Treat an unset or empty SECRET_KEY (e.g. `SECRET_KEY=` in .env forwarded by compose)
+        # as "not provided" and mint a per-process one. Sessions invalidate on restart.
+        return v or secrets.token_hex(32)
 
     @property
     def data_file(self) -> Path:

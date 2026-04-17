@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.github/
+.claude/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.spec
+
+# Local state — never bake into images
+.env
+data.json
+/data/
+ssl_temp/
+
+# Docs + screenshots are repo-only
+docs/
+screen/
