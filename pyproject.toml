@@ -54,9 +54,6 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# `perform_toggle_user` is called but never defined — tracked in docs/RISK_AUDIT.md C-1.
-# Remove this ignore once C-1 is fixed.
-"src/amnezia_panel/app.py" = ["F821"]
 # Protocol managers embed shell scripts and Dockerfiles as triple-quoted strings.
 # Splitting them would break shell syntax inside quoted arguments.
 "src/amnezia_panel/protocols/*.py" = ["E501"]

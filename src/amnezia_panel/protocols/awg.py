@@ -62,6 +62,40 @@ def generate_psk():
     return b64encode(secrets.token_bytes(32)).decode()
 
 
+AWG_PARAM_KEYS = (
+    "junk_packet_count",
+    "junk_packet_min_size",
+    "junk_packet_max_size",
+    "init_packet_junk_size",
+    "response_packet_junk_size",
+    "cookie_reply_packet_junk_size",
+    "transport_packet_junk_size",
+    "init_packet_magic_header",
+    "response_packet_magic_header",
+    "underload_packet_magic_header",
+    "transport_packet_magic_header",
+)
+
+
+def sanitize_awg_params(params):
+    """Coerce every AWG param to a non-negative integer string. Guards against shell injection
+    via a tampered backup restore — values are interpolated into bash config scripts."""
+    if not isinstance(params, dict):
+        raise ValueError("awg_params must be a dict")
+    clean = {}
+    for key in AWG_PARAM_KEYS:
+        if key not in params:
+            raise ValueError(f"awg_params missing required key: {key}")
+        try:
+            n = int(str(params[key]))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"awg_params[{key}] must be an integer, got {params[key]!r}") from e
+        if n < 0:
+            raise ValueError(f"awg_params[{key}] must be non-negative")
+        clean[key] = str(n)
+    return clean
+
+
 def generate_awg_params(use_ranges=False):
     """Generate random AWG obfuscation parameters."""
     import random
@@ -376,6 +410,7 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
     def _configure_container(self, protocol_type, port, awg_params):
         """Configure the AWG container (generate keys and server config)."""
+        awg_params = sanitize_awg_params(awg_params)
         container_name = self._container_name(protocol_type)
         wg_bin = self._wg_binary(protocol_type)
         config_path = self._config_path(protocol_type)
@@ -650,7 +685,7 @@ tail -f /dev/null
         return ips
 
     def _get_next_ip(self, protocol_type):
-        """Calculate the next available IP for a new client."""
+        """Calculate the next available IP for a new client. Raises when /24 subnet exhausted."""
         used_ips = self._get_used_ips(protocol_type)
         if not used_ips:
             base = AWG_DEFAULTS["subnet_address"]
@@ -658,17 +693,12 @@ tail -f /dev/null
             parts[3] = "2"
             return ".".join(parts)
 
-        # Get the last used IP and increment
         last_ip = used_ips[-1]
         parts = last_ip.split(".")
-        last_octet = int(parts[3])
+        next_octet = int(parts[3]) + 1
 
-        if last_octet == 254:
-            next_octet = last_octet + 3
-        elif last_octet == 255:
-            next_octet = last_octet + 2
-        else:
-            next_octet = last_octet + 1
+        if next_octet > 254:
+            raise RuntimeError(f"AWG /24 subnet exhausted: last allocated IP was {last_ip}")
 
         parts[3] = str(next_octet)
         return ".".join(parts)

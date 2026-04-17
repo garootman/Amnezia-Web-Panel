@@ -9,6 +9,13 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 
+def _write_secret(path: str, content: str) -> None:
+    """Write a file (0o600) — for TLS private keys and other credentials."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+
+
 def main() -> None:
     data = load_data()
     ssl_conf = data.get("settings", {}).get("ssl", {})
@@ -20,12 +27,10 @@ def main() -> None:
         settings.ssl_temp_dir.mkdir(parents=True, exist_ok=True)
         if ssl_conf.get("cert_text"):
             cert_file = str(settings.ssl_temp_dir / "cert.pem")
-            with open(cert_file, "w") as f:
-                f.write(ssl_conf["cert_text"].strip() + "\n")
+            _write_secret(cert_file, ssl_conf["cert_text"].strip() + "\n")
         if ssl_conf.get("key_text"):
             key_file = str(settings.ssl_temp_dir / "key.pem")
-            with open(key_file, "w") as f:
-                f.write(ssl_conf["key_text"].strip() + "\n")
+            _write_secret(key_file, ssl_conf["key_text"].strip() + "\n")
 
     uvicorn_kwargs = {
         "app": app,

@@ -1,11 +1,15 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import io
 import json
 import logging
 import os
+import re
 import secrets
+import tempfile
+import time
 import uuid
 from datetime import datetime
 
@@ -15,7 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from multicolorcaptcha import CaptchaGenerator
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import telegram_bot as tg_bot
@@ -30,7 +34,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Amnezia Web Panel")
-app.add_middleware(SessionMiddleware, secret_key=settings.secret_key)
+
+
+def _ssl_enabled_at_boot() -> bool:
+    try:
+        with open(str(settings.data_file), encoding="utf-8") as f:
+            return bool(json.load(f).get("settings", {}).get("ssl", {}).get("enabled", False))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.secret_key,
+    same_site="strict",
+    https_only=_ssl_enabled_at_boot(),
+)
 
 app.mount("/static", StaticFiles(directory=str(settings.assets_dir / "static")), name="static")
 templates = Jinja2Templates(directory=str(settings.assets_dir / "templates"))
@@ -110,12 +129,22 @@ def load_data():
 
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    dir_ = os.path.dirname(DATA_FILE) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".data.", suffix=".tmp", dir=dir_)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, DATA_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 async def save_data_async(data):
-    """Saves data to file in a thread-safe way."""
+    """Save data to file in a thread-safe way."""
     async with DATA_LOCK:
         await asyncio.to_thread(save_data, data)
 
@@ -160,7 +189,7 @@ def verify_password(password: str, password_hash: str) -> bool:
     try:
         salt, h = password_hash.split("$", 1)
         new_h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000)
-        return new_h.hex() == h
+        return hmac.compare_digest(new_h.hex(), h)
     except Exception:
         return False
 
@@ -177,14 +206,23 @@ async def perform_delete_user(data: dict, user_id: str):
             if sid < len(data["servers"]):
                 server = data["servers"][sid]
                 ssh = get_ssh(server)
-                ssh.connect()
+                await asyncio.to_thread(ssh.connect)
                 manager = get_protocol_manager(ssh, uc["protocol"])
-                manager.remove_client(uc["protocol"], uc["client_id"])
-                ssh.disconnect()
+                await asyncio.to_thread(manager.remove_client, uc["protocol"], uc["client_id"])
+                await asyncio.to_thread(ssh.disconnect)
         except Exception as e:
             logger.warning(f"Failed to remove connection {uc['client_id']} during user delete: {e}")
     data["user_connections"] = [c for c in data.get("user_connections", []) if c["user_id"] != user_id]
     data["users"] = [u for u in data["users"] if u["id"] != user_id]
+    return True
+
+
+async def perform_toggle_user(data: dict, user_id: str, enabled: bool) -> bool:
+    user = next((u for u in data["users"] if u["id"] == user_id), None)
+    if not user:
+        return False
+    user["enabled"] = enabled
+    await perform_mass_operations(toggle_uids=[(user_id, enabled)])
     return True
 
 
@@ -241,7 +279,7 @@ async def perform_mass_operations(
                     current_data["user_connections"] = [
                         conn for conn in current_data["user_connections"] if conn["id"] != c["id"]
                     ]
-                    save_data(current_data)
+                    await asyncio.to_thread(save_data, current_data)
 
             # 2. Toggles
             for c, enabled in ops["toggle"]:
@@ -253,7 +291,7 @@ async def perform_mass_operations(
                     # We also need to update user status if it was a user toggle
                     # Wait, mass ops caller usually handles user enabled status.
                     # Here we just toggle the actual wireguard peer.
-                    save_data(current_data)
+                    await asyncio.to_thread(save_data, current_data)
 
             # 3. Creates
             for c_req in ops["create"]:
@@ -276,7 +314,7 @@ async def perform_mass_operations(
                     async with DATA_LOCK:
                         current_data = load_data()
                         current_data["user_connections"].append(new_conn)
-                        save_data(current_data)
+                        await asyncio.to_thread(save_data, current_data)
 
             await asyncio.to_thread(ssh.disconnect)
         except Exception as e:
@@ -300,7 +338,7 @@ async def perform_mass_operations(
                 user = next((u for u in current_data["users"] if u["id"] == uid), None)
                 if user:
                     user["enabled"] = enabled
-        save_data(current_data)
+        await asyncio.to_thread(save_data, current_data)
 
     return True
 
@@ -366,7 +404,16 @@ async def sync_users_with_remnawave(data: dict):
                 data = load_data()
                 local_u = next((u for u in data["users"] if u.get("remnawave_uuid") == rw_u["uuid"]), None)
                 if not local_u:
-                    local_u = next((u for u in data["users"] if u["username"] == rw_u["username"]), None)
+                    # Fall back to username match ONLY for users that were already Remnawave-imported
+                    # (empty password_hash). Never hijack a local admin account that shares a username.
+                    local_u = next(
+                        (
+                            u
+                            for u in data["users"]
+                            if u["username"] == rw_u["username"] and not u.get("password_hash")
+                        ),
+                        None,
+                    )
 
                 is_active = rw_u.get("status") == "ACTIVE"
 
@@ -387,7 +434,7 @@ async def sync_users_with_remnawave(data: dict):
                         idx = next((i for i, u in enumerate(current["users"]) if u["id"] == local_u["id"]), -1)
                         if idx != -1:
                             current["users"][idx] = local_u
-                            save_data(current)
+                            await asyncio.to_thread(save_data, current)
 
                     synced_count += 1
                 else:
@@ -410,7 +457,7 @@ async def sync_users_with_remnawave(data: dict):
                     async with DATA_LOCK:
                         current = load_data()
                         current["users"].append(new_user)
-                        save_data(current)
+                        await asyncio.to_thread(save_data, current)
 
                     if settings.get("remnawave_create_conns"):
                         sid = settings.get("remnawave_server_id")
@@ -487,12 +534,32 @@ class AddServerRequest(BaseModel):
     name: str = ""
 
 
+_HOSTNAME_LABEL = r"[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?"
+_HOSTNAME_RE = re.compile(rf"^{_HOSTNAME_LABEL}(\.{_HOSTNAME_LABEL})*$")
+
+
 class InstallProtocolRequest(BaseModel):
     protocol: str = "awg"
     port: str = "55424"
     tls_emulation: bool | None = None
     tls_domain: str | None = None
     max_connections: int | None = None
+
+    @field_validator("port")
+    @classmethod
+    def _validate_port(cls, v: str) -> str:
+        if not v.isdigit() or not (1 <= int(v) <= 65535):
+            raise ValueError("port must be a number between 1 and 65535")
+        return v
+
+    @field_validator("tls_domain")
+    @classmethod
+    def _validate_tls_domain(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return v
+        if len(v) > 253 or not _HOSTNAME_RE.match(v):
+            raise ValueError("tls_domain must be a valid hostname")
+        return v
 
 
 class ProtocolRequest(BaseModel):
@@ -640,6 +707,57 @@ class ShareAuthRequest(BaseModel):
 # ======================== Startup ========================
 
 
+def _apply_schema_migrations(data: dict) -> bool:
+    """Backfill fields on users/settings for older data.json schemas. Returns True if anything changed."""
+    changed = False
+    for u in data.get("users", []):
+        migrated = False
+        if "share_enabled" not in u:
+            u["share_enabled"] = False
+            migrated = True
+        if not u.get("share_token"):
+            u["share_token"] = secrets.token_urlsafe(16)
+            migrated = True
+        if "share_password_hash" not in u:
+            u["share_password_hash"] = None
+            migrated = True
+        if "traffic_reset_strategy" not in u:
+            u["traffic_reset_strategy"] = "never"
+            migrated = True
+        if "traffic_total" not in u:
+            u["traffic_total"] = u.get("traffic_used", 0)
+            migrated = True
+        if "last_reset_at" not in u:
+            u["last_reset_at"] = datetime.now().isoformat()
+            migrated = True
+        if "expiration_date" not in u:
+            u["expiration_date"] = None
+            migrated = True
+        if migrated:
+            changed = True
+            logger.info(f"Migrated user {u['username']} to new traffic/sharing fields")
+
+    if "ssl" not in data.get("settings", {}):
+        data.setdefault("settings", {})
+        data["settings"]["ssl"] = {
+            "enabled": False,
+            "domain": "",
+            "cert_path": "",
+            "key_path": "",
+            "cert_text": "",
+            "key_text": "",
+        }
+        changed = True
+        logger.info("Migrated SSL settings")
+
+    if "panel_port" in data.get("settings", {}).get("ssl", {}):
+        data["settings"]["ssl"].pop("panel_port", None)
+        changed = True
+        logger.info("Removed legacy ssl.panel_port from data.json (use PANEL_PORT env instead)")
+
+    return changed
+
+
 @app.on_event("startup")
 async def startup():
     data = load_data()
@@ -658,60 +776,11 @@ async def startup():
         changed = True
         logger.info("Default admin created (admin / admin)")
 
-    # Migration for sharing fields and traffic reset strategy
-    for u in data["users"]:
-        migrated = False
-        if "share_enabled" not in u:
-            u["share_enabled"] = False
-            migrated = True
-        if not u.get("share_token"):
-            u["share_token"] = secrets.token_urlsafe(16)
-            migrated = True
-        if "share_password_hash" not in u:
-            u["share_password_hash"] = None
-            migrated = True
-
-        # Traffic reset strategy and total traffic
-        if "traffic_reset_strategy" not in u:
-            u["traffic_reset_strategy"] = "never"
-            migrated = True
-        if "traffic_total" not in u:
-            u["traffic_total"] = u.get("traffic_used", 0)
-            migrated = True
-        if "last_reset_at" not in u:
-            u["last_reset_at"] = datetime.now().isoformat()
-            migrated = True
-        if "expiration_date" not in u:
-            u["expiration_date"] = None
-            migrated = True
-
-        if migrated:
-            changed = True
-            logger.info(f"Migrated user {u['username']} to new traffic/sharing fields")
-
-    # SSL settings migration
-    if "ssl" not in data.get("settings", {}):
-        if "settings" not in data:
-            data["settings"] = {}
-        data["settings"]["ssl"] = {
-            "enabled": False,
-            "domain": "",
-            "cert_path": "",
-            "key_path": "",
-            "cert_text": "",
-            "key_text": "",
-        }
+    if _apply_schema_migrations(data):
         changed = True
-        logger.info("Migrated SSL settings")
-
-    # Drop legacy ssl.panel_port — port is configured via PANEL_PORT env / .env now.
-    if "panel_port" in data.get("settings", {}).get("ssl", {}):
-        data["settings"]["ssl"].pop("panel_port", None)
-        changed = True
-        logger.info("Removed legacy ssl.panel_port from data.json (use PANEL_PORT env instead)")
 
     if changed:
-        save_data(data)
+        await save_data_async(data)
 
     # Start periodic background tasks. Keep a reference so the task isn't garbage-collected.
     _BACKGROUND_TASKS.add(asyncio.create_task(periodic_background_tasks()))
@@ -840,7 +909,7 @@ async def periodic_background_tasks():
                                                 to_disable_uids.append(uid)
                                     except Exception:
                                         pass
-                    save_data(curr_data)
+                    await asyncio.to_thread(save_data, curr_data)
 
             if to_disable_uids:
                 logger.info(f"Traffic limit reached, disabling users: {to_disable_uids}")
@@ -875,6 +944,9 @@ async def login_page(request: Request):
 @app.get("/set_lang/{lang}")
 async def set_lang(lang: str, request: Request):
     ref = request.headers.get("referer", "/")
+    # Only allow same-origin redirects — prevents Referer-driven open redirect.
+    if not ref.startswith("/"):
+        ref = "/"
     response = RedirectResponse(url=ref)
     response.set_cookie(key="lang", value=lang, max_age=31536000)
     return response
@@ -962,8 +1034,47 @@ async def api_captcha(request: Request):
     return StreamingResponse(img_bytes, media_type="image/png")
 
 
+# Per-IP login failure tracking. Exponential backoff caps at 30s. Resets on successful login.
+_LOGIN_FAILURES: dict[str, tuple[int, float]] = {}
+_LOGIN_FAILURE_WINDOW = 900  # 15 minutes
+_LOGIN_BACKOFF_MAX = 30.0
+
+
+def _client_ip(request: Request) -> str:
+    # SessionMiddleware sits behind the reverse proxy in production; fall back to the socket peer.
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _login_backoff_seconds(ip: str) -> float:
+    entry = _LOGIN_FAILURES.get(ip)
+    if not entry:
+        return 0.0
+    count, last = entry
+    if time.time() - last > _LOGIN_FAILURE_WINDOW:
+        _LOGIN_FAILURES.pop(ip, None)
+        return 0.0
+    return min(_LOGIN_BACKOFF_MAX, 0.5 * (2 ** max(0, count - 1)))
+
+
+def _record_login_failure(ip: str) -> None:
+    count = _LOGIN_FAILURES.get(ip, (0, 0.0))[0] + 1
+    _LOGIN_FAILURES[ip] = (count, time.time())
+
+
+def _clear_login_failures(ip: str) -> None:
+    _LOGIN_FAILURES.pop(ip, None)
+
+
 @app.post("/api/auth/login")
 async def api_login(request: Request, req: LoginRequest):
+    ip = _client_ip(request)
+    backoff = _login_backoff_seconds(ip)
+    if backoff > 0:
+        await asyncio.sleep(backoff)
+
     data = load_data()
     captcha_settings = data.get("settings", {}).get("captcha", {})
     if captcha_settings.get("enabled") is True:
@@ -971,6 +1082,7 @@ async def api_login(request: Request, req: LoginRequest):
         lang = request.cookies.get("lang", "ru")
         if not answer or not req.captcha or answer.lower() != req.captcha.lower():
             request.session.pop("captcha_answer", None)
+            _record_login_failure(ip)
             return JSONResponse({"error": _t("invalid_captcha", lang)}, status_code=400)
         request.session.pop("captcha_answer", None)
 
@@ -980,8 +1092,10 @@ async def api_login(request: Request, req: LoginRequest):
             if not u.get("enabled", True):
                 return JSONResponse({"error": _t("account_disabled", lang)}, status_code=403)
             request.session["user_id"] = u["id"]
+            _clear_login_failures(ip)
             return {"status": "success", "role": u["role"]}
     lang = request.cookies.get("lang", "ru")
+    _record_login_failure(ip)
     return JSONResponse({"error": _t("invalid_login", lang)}, status_code=401)
 
 
@@ -1010,9 +1124,9 @@ async def api_add_server(request: Request, req: AddServerRequest):
 
         ssh = SSHManager(host, req.ssh_port, username, req.password, req.private_key)
         try:
-            ssh.connect()
-            server_info = ssh.test_connection()
-            ssh.disconnect()
+            await asyncio.to_thread(ssh.connect)
+            server_info = await asyncio.to_thread(ssh.test_connection)
+            await asyncio.to_thread(ssh.disconnect)
         except Exception as e:
             return JSONResponse({"error": f"Connection failed: {e!s}"}, status_code=400)
 
@@ -1028,7 +1142,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
         }
         data = load_data()
         data["servers"].append(server)
-        save_data(data)
+        await save_data_async(data)
         return {"status": "success", "server_id": len(data["servers"]) - 1, "server_info": server_info}
     except Exception as e:
         logger.exception("Error adding server")
@@ -1050,7 +1164,7 @@ async def api_delete_server(request: Request, server_id: int):
         for c in data.get("user_connections", []):
             if c.get("server_id", 0) > server_id:
                 c["server_id"] -= 1
-        save_data(data)
+        await save_data_async(data)
         return {"status": "success"}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1066,13 +1180,13 @@ async def api_reboot_server(request: Request, server_id: int):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
         ssh = get_ssh(server)
-        ssh.connect()
+        await asyncio.to_thread(ssh.connect)
         try:
-            ssh.run_sudo_command("nohup reboot > /dev/null 2>&1 &")
+            await asyncio.to_thread(ssh.run_sudo_command, "nohup reboot > /dev/null 2>&1 &")
         except Exception:
             pass
         try:
-            ssh.disconnect()
+            await asyncio.to_thread(ssh.disconnect)
         except Exception:
             pass
         return {"status": "success"}
@@ -1090,18 +1204,33 @@ async def api_clear_server(request: Request, server_id: int):
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        containers = ["amnezia-awg", "amnezia-awg2", "amnezia-awg-legacy", "amnezia-xray", "telemt", "amnezia-dns"]
-        for c in containers:
-            ssh.run_sudo_command(f"docker stop {c} || true")
-            ssh.run_sudo_command(f"docker rm {c} || true")
-        ssh.run_sudo_command("docker network rm amnezia-dns-net || true")
-        ssh.run_sudo_command("rm -rf /opt/amnezia")
 
+        def _clear():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                containers = [
+                    "amnezia-awg",
+                    "amnezia-awg2",
+                    "amnezia-awg-legacy",
+                    "amnezia-xray",
+                    "telemt",
+                    "amnezia-dns",
+                ]
+                for c in containers:
+                    ssh.run_sudo_command(f"docker stop {c} || true")
+                    ssh.run_sudo_command(f"docker rm {c} || true")
+                ssh.run_sudo_command("docker network rm amnezia-dns-net || true")
+                ssh.run_sudo_command("rm -rf /opt/amnezia")
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(_clear)
         server["protocols"] = {}
-        save_data(data)
-        ssh.disconnect()
+        await save_data_async(data)
         return {"status": "success"}
     except Exception as e:
         logger.exception("Error clearing server")
@@ -1117,47 +1246,57 @@ async def api_server_stats(request: Request, server_id: int):
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        stats = {}
-        out, _, _ = ssh.run_command(
-            "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || "
-            "awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){pu=u;pt=t} else printf \"%.1f\", (u-pu)/(t-pt)*100}' "
-            "<(grep 'cpu ' /proc/stat) <(sleep 0.5 && grep 'cpu ' /proc/stat) 2>/dev/null"
-        )
-        try:
-            stats["cpu"] = round(float(out.strip().split("\n")[0]), 1)
-        except (ValueError, IndexError):
-            stats["cpu"] = 0
-        out, _, _ = ssh.run_command("free -b | awk 'NR==2{printf \"%d %d\", $3, $2}'")
-        try:
-            parts = out.strip().split()
-            used, total = int(parts[0]), int(parts[1])
-            stats.update(ram_used=used, ram_total=total, ram_percent=round(used / total * 100, 1) if total > 0 else 0)
-        except (ValueError, IndexError):
-            stats.update(ram_used=0, ram_total=0, ram_percent=0)
-        out, _, _ = ssh.run_command("df -B1 / | awk 'NR==2{printf \"%d %d\", $3, $2}'")
-        try:
-            parts = out.strip().split()
-            used, total = int(parts[0]), int(parts[1])
-            stats.update(
-                disk_used=used, disk_total=total, disk_percent=round(used / total * 100, 1) if total > 0 else 0
-            )
-        except (ValueError, IndexError):
-            stats.update(disk_used=0, disk_total=0, disk_percent=0)
-        out, _, _ = ssh.run_command(
-            "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
-            'cat /proc/net/dev | awk -v dev="$DEV:" \'$1==dev{printf "%d %d", $2, $10}\''
-        )
-        try:
-            parts = out.strip().split()
-            stats["net_rx"], stats["net_tx"] = int(parts[0]), int(parts[1])
-        except (ValueError, IndexError):
-            stats["net_rx"] = stats["net_tx"] = 0
-        out, _, _ = ssh.run_command("uptime -p 2>/dev/null || uptime")
-        stats["uptime"] = out.strip()
-        ssh.disconnect()
-        return stats
+
+        def _collect_stats():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                stats = {}
+                out, _, _ = ssh.run_command(
+                    "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || "
+                    "awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){pu=u;pt=t} else printf \"%.1f\", (u-pu)/(t-pt)*100}' "
+                    "<(grep 'cpu ' /proc/stat) <(sleep 0.5 && grep 'cpu ' /proc/stat) 2>/dev/null"
+                )
+                try:
+                    stats["cpu"] = round(float(out.strip().split("\n")[0]), 1)
+                except (ValueError, IndexError):
+                    stats["cpu"] = 0
+                out, _, _ = ssh.run_command("free -b | awk 'NR==2{printf \"%d %d\", $3, $2}'")
+                try:
+                    parts = out.strip().split()
+                    used, total = int(parts[0]), int(parts[1])
+                    ram_pct = round(used / total * 100, 1) if total > 0 else 0
+                    stats.update(ram_used=used, ram_total=total, ram_percent=ram_pct)
+                except (ValueError, IndexError):
+                    stats.update(ram_used=0, ram_total=0, ram_percent=0)
+                out, _, _ = ssh.run_command("df -B1 / | awk 'NR==2{printf \"%d %d\", $3, $2}'")
+                try:
+                    parts = out.strip().split()
+                    used, total = int(parts[0]), int(parts[1])
+                    stats.update(
+                        disk_used=used, disk_total=total, disk_percent=round(used / total * 100, 1) if total > 0 else 0
+                    )
+                except (ValueError, IndexError):
+                    stats.update(disk_used=0, disk_total=0, disk_percent=0)
+                out, _, _ = ssh.run_command(
+                    "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
+                    'cat /proc/net/dev | awk -v dev="$DEV:" \'$1==dev{printf "%d %d", $2, $10}\''
+                )
+                try:
+                    parts = out.strip().split()
+                    stats["net_rx"], stats["net_tx"] = int(parts[0]), int(parts[1])
+                except (ValueError, IndexError):
+                    stats["net_rx"] = stats["net_tx"] = 0
+                out, _, _ = ssh.run_command("uptime -p 2>/dev/null || uptime")
+                stats["uptime"] = out.strip()
+                return stats
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        return await asyncio.to_thread(_collect_stats)
     except Exception as e:
         logger.exception("Error getting server stats")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1172,21 +1311,29 @@ async def api_check_server(request: Request, server_id: int):
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        # Just use awg's docker checker since it uses the same command
-        manager = get_protocol_manager(ssh, "awg")
-        status = {"connection": "ok", "docker_installed": manager.check_docker_installed(), "protocols": {}}
 
+        docker_ssh = get_ssh(server)
+        await asyncio.to_thread(docker_ssh.connect)
+        try:
+            manager = get_protocol_manager(docker_ssh, "awg")
+            docker_installed = await asyncio.to_thread(manager.check_docker_installed)
+        finally:
+            await asyncio.to_thread(docker_ssh.disconnect)
+
+        status = {"connection": "ok", "docker_installed": docker_installed, "protocols": {}}
         changed = False
         if "protocols" not in server:
             server["protocols"] = {}
 
         import concurrent.futures
 
+        # Each thread gets its own SSH transport — paramiko's exec_command is not safe to call
+        # concurrently on a shared client.
         def check_proto(proto):
+            proto_ssh = get_ssh(server)
             try:
-                p_manager = get_protocol_manager(ssh, proto)
+                proto_ssh.connect()
+                p_manager = get_protocol_manager(proto_ssh, proto)
                 result = p_manager.get_server_status(proto)
                 db_proto = server.get("protocols", {}).get(proto, {})
                 if not result.get("port") and db_proto.get("port"):
@@ -1194,35 +1341,37 @@ async def api_check_server(request: Request, server_id: int):
                 return proto, result, None
             except Exception as e:
                 return proto, None, str(e)
+            finally:
+                try:
+                    proto_ssh.disconnect()
+                except Exception:
+                    pass
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
-            futures = [
-                executor.submit(check_proto, p)
-                for p in ["awg", "awg2", "awg_legacy", "xray", "telemt", "dns", "wireguard"]
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                proto, result, err = future.result()
-                if err:
-                    status["protocols"][proto] = {"error": err}
+        protocols = ["awg", "awg2", "awg_legacy", "xray", "telemt", "dns", "wireguard"]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(protocols)) as executor:
+            results = await asyncio.to_thread(lambda: list(executor.map(check_proto, protocols)))
+
+        for proto, result, err in results:
+            if err:
+                status["protocols"][proto] = {"error": err}
+            else:
+                status["protocols"][proto] = result
+                if result.get("container_exists"):
+                    if proto not in server["protocols"]:
+                        server["protocols"][proto] = {
+                            "installed": True,
+                            "port": result.get("port", "55424"),
+                            "awg_params": result.get("awg_params", {}),
+                        }
+                        changed = True
                 else:
-                    status["protocols"][proto] = result
-                    if result.get("container_exists"):
-                        if proto not in server["protocols"]:
-                            server["protocols"][proto] = {
-                                "installed": True,
-                                "port": result.get("port", "55424"),
-                                "awg_params": result.get("awg_params", {}),
-                            }
-                            changed = True
-                    else:
-                        if proto in server["protocols"]:
-                            del server["protocols"][proto]
-                            changed = True
+                    if proto in server["protocols"]:
+                        del server["protocols"][proto]
+                        changed = True
 
         if changed:
-            save_data(data)
+            await save_data_async(data)
 
-        ssh.disconnect()
         return status
     except Exception as e:
         logger.exception("Error checking server")
@@ -1241,31 +1390,37 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             return JSONResponse({"error": "Invalid protocol type"}, status_code=400)
 
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
 
-        # Pass parameters to installer
-        if req.protocol == "telemt":
-            result = manager.install_protocol(
-                protocol_type=req.protocol,
-                port=req.port,
-                tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
-                tls_domain=req.tls_domain,
-                max_connections=req.max_connections if req.max_connections is not None else 0,
-            )
-        elif req.protocol == "xray" or req.protocol == "wireguard":
-            result = manager.install_protocol(port=req.port)
-        else:
-            result = manager.install_protocol(req.protocol, port=req.port)
+        def _install():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                manager = get_protocol_manager(ssh, req.protocol)
+                if req.protocol == "telemt":
+                    return manager.install_protocol(
+                        protocol_type=req.protocol,
+                        port=req.port,
+                        tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
+                        tls_domain=req.tls_domain,
+                        max_connections=req.max_connections if req.max_connections is not None else 0,
+                    )
+                if req.protocol in ("xray", "wireguard"):
+                    return manager.install_protocol(port=req.port)
+                return manager.install_protocol(req.protocol, port=req.port)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        result = await asyncio.to_thread(_install)
 
         server["protocols"][req.protocol] = {
             "installed": True,
             "port": req.port,
             "awg_params": result.get("awg_params", {}),
         }
-        save_data(data)
-        ssh.disconnect()
+        await save_data_async(data)
         return result
     except Exception as e:
         logger.exception("Error installing protocol")
@@ -1281,14 +1436,23 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        manager.remove_container(req.protocol)
+
+        def _uninstall():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                manager = get_protocol_manager(ssh, req.protocol)
+                manager.remove_container(req.protocol)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(_uninstall)
         if req.protocol in server.get("protocols", {}):
             del server["protocols"][req.protocol]
-            save_data(data)
-        ssh.disconnect()
+            await save_data_async(data)
         return {"status": "success"}
     except Exception as e:
         logger.exception("Error uninstalling protocol")
@@ -1319,18 +1483,25 @@ async def api_container_toggle(request: Request, server_id: int, req: ProtocolRe
         if not container:
             return JSONResponse({"error": "Unknown protocol"}, status_code=400)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        # Check current state
-        out, _, _ = ssh.run_sudo_command(f"docker inspect -f '{{{{.State.Running}}}}' {container} 2>/dev/null")
-        is_running = out.strip().lower() == "true"
-        if is_running:
-            ssh.run_sudo_command(f"docker stop {container}")
-            action = "stopped"
-        else:
-            ssh.run_sudo_command(f"docker start {container}")
-            action = "started"
-        ssh.disconnect()
+
+        def _toggle():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                out, _, _ = ssh.run_sudo_command(f"docker inspect -f '{{{{.State.Running}}}}' {container} 2>/dev/null")
+                is_running = out.strip().lower() == "true"
+                if is_running:
+                    ssh.run_sudo_command(f"docker stop {container}")
+                    return "stopped"
+                ssh.run_sudo_command(f"docker start {container}")
+                return "started"
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        action = await asyncio.to_thread(_toggle)
         return {"status": "success", "action": action, "container": container}
     except Exception as e:
         logger.exception("Error toggling container")
@@ -1347,24 +1518,29 @@ async def api_server_config(request: Request, server_id: int, req: ProtocolReque
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        from .protocols.telemt import TelemtManager
 
-        if req.protocol == "xray":
-            mgr = XrayManager(ssh)
-            data_json = mgr._get_server_json()
-            config = json.dumps(data_json, indent=2, ensure_ascii=False) if data_json else ""
-        elif req.protocol == "telemt":
-            mgr = TelemtManager(ssh)
-            config = mgr._get_server_config()
-        elif req.protocol == "wireguard":
-            mgr = WireGuardManager(ssh)
-            config = mgr._get_server_config()
-        else:
-            mgr = AWGManager(ssh)
-            config = mgr._get_server_config(req.protocol)
-        ssh.disconnect()
+        def _get_config():
+            from .protocols.telemt import TelemtManager
+
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                if req.protocol == "xray":
+                    mgr = XrayManager(ssh)
+                    data_json = mgr._get_server_json()
+                    return json.dumps(data_json, indent=2, ensure_ascii=False) if data_json else ""
+                if req.protocol == "telemt":
+                    return TelemtManager(ssh)._get_server_config()
+                if req.protocol == "wireguard":
+                    return WireGuardManager(ssh)._get_server_config()
+                return AWGManager(ssh)._get_server_config(req.protocol)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        config = await asyncio.to_thread(_get_config)
         return {"config": config}
     except Exception as e:
         logger.exception("Error getting server config")
@@ -1381,28 +1557,34 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        from .protocols.telemt import TelemtManager
 
         if req.protocol == "xray":
-            mgr = XrayManager(ssh)
             try:
-                data_json = json.loads(req.config)
+                parsed_json = json.loads(req.config)
             except Exception as e:
-                ssh.disconnect()
                 return JSONResponse({"error": f"Invalid JSON format: {e!s}"}, status_code=400)
-            mgr._save_server_json(data_json)
-        elif req.protocol == "telemt":
-            mgr = TelemtManager(ssh)
-            mgr.save_server_config(req.protocol, req.config)
-        elif req.protocol == "wireguard":
-            mgr = WireGuardManager(ssh)
-            mgr.save_server_config(req.config)
-        else:
-            mgr = AWGManager(ssh)
-            mgr.save_server_config(req.protocol, req.config)
-        ssh.disconnect()
+
+        def _save_config():
+            from .protocols.telemt import TelemtManager
+
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                if req.protocol == "xray":
+                    XrayManager(ssh)._save_server_json(parsed_json)
+                elif req.protocol == "telemt":
+                    TelemtManager(ssh).save_server_config(req.protocol, req.config)
+                elif req.protocol == "wireguard":
+                    WireGuardManager(ssh).save_server_config(req.config)
+                else:
+                    AWGManager(ssh).save_server_config(req.protocol, req.config)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(_save_config)
         return {"status": "success"}
     except Exception as e:
         logger.exception("Error saving server config")
@@ -1420,11 +1602,19 @@ async def api_get_connections(request: Request, server_id: int, protocol: str = 
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, protocol)
-        clients = manager.get_clients(protocol)
-        ssh.disconnect()
+
+        def _get_clients():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                return get_protocol_manager(ssh, protocol).get_clients(protocol)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        clients = await asyncio.to_thread(_get_clients)
 
         # Enrich with user info from user_connections
         user_conns = data.get("user_connections", [])
@@ -1457,26 +1647,33 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
         server = data["servers"][server_id]
         proto_info = server.get("protocols", {}).get(req.protocol, {})
         port = proto_info.get("port", "55424")
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
 
-        if req.protocol == "telemt":
-            result = manager.add_client(
-                req.protocol,
-                req.name,
-                server["host"],
-                port,
-                telemt_quota=req.telemt_quota,
-                telemt_max_ips=req.telemt_max_ips,
-                telemt_expiry=req.telemt_expiry,
-                secret=req.telemt_secret,
-                user_ad_tag=req.telemt_ad_tag,
-                max_tcp_conns=req.telemt_max_conns,
-            )
-        else:
-            result = manager.add_client(req.protocol, req.name, server["host"], port)
-        ssh.disconnect()
+        def _add_client():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                manager = get_protocol_manager(ssh, req.protocol)
+                if req.protocol == "telemt":
+                    return manager.add_client(
+                        req.protocol,
+                        req.name,
+                        server["host"],
+                        port,
+                        telemt_quota=req.telemt_quota,
+                        telemt_max_ips=req.telemt_max_ips,
+                        telemt_expiry=req.telemt_expiry,
+                        secret=req.telemt_secret,
+                        user_ad_tag=req.telemt_ad_tag,
+                        max_tcp_conns=req.telemt_max_conns,
+                    )
+                return manager.add_client(req.protocol, req.name, server["host"], port)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        result = await asyncio.to_thread(_add_client)
 
         if result.get("config"):
             result["vpn_link"] = generate_vpn_link(result["config"])
@@ -1493,7 +1690,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
                 "created_at": datetime.now().isoformat(),
             }
             data["user_connections"].append(conn)
-            save_data(data)
+            await save_data_async(data)
 
         return result
     except Exception as e:
@@ -1512,18 +1709,25 @@ async def api_remove_connection(request: Request, server_id: int, req: Connectio
         server = data["servers"][server_id]
         if not req.client_id:
             return JSONResponse({"error": "Client ID is required"}, status_code=400)
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        manager.remove_client(req.protocol, req.client_id)
-        ssh.disconnect()
-        # Remove from user_connections
+
+        def _remove():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                get_protocol_manager(ssh, req.protocol).remove_client(req.protocol, req.client_id)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(_remove)
         data["user_connections"] = [
             c
             for c in data.get("user_connections", [])
             if not (c.get("client_id") == req.client_id and c.get("server_id") == server_id)
         ]
-        save_data(data)
+        await save_data_async(data)
         return {"status": "success"}
     except Exception as e:
         logger.exception("Error removing connection")
@@ -1540,10 +1744,6 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
 
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-
         edit_params = {}
         if req.protocol == "telemt":
             edit_params["telemt_quota"] = req.telemt_quota
@@ -1553,9 +1753,18 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
             edit_params["user_ad_tag"] = req.telemt_ad_tag
             edit_params["max_tcp_conns"] = req.telemt_max_conns
 
-        result = manager.edit_client(req.protocol, req.client_id, edit_params)
-        ssh.disconnect()
-        return result
+        def _edit():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                return get_protocol_manager(ssh, req.protocol).edit_client(req.protocol, req.client_id, edit_params)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        return await asyncio.to_thread(_edit)
     except Exception as e:
         logger.exception("Error editing connection")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1586,11 +1795,21 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
             return JSONResponse({"error": "Client ID is required"}, status_code=400)
         proto_info = server.get("protocols", {}).get(req.protocol, {})
         port = proto_info.get("port", "55424")
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        config = manager.get_client_config(req.protocol, req.client_id, server["host"], port)
-        ssh.disconnect()
+
+        def _get_config():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                return get_protocol_manager(ssh, req.protocol).get_client_config(
+                    req.protocol, req.client_id, server["host"], port
+                )
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        config = await asyncio.to_thread(_get_config)
         vpn_link = generate_vpn_link(config) if config else ""
         return {"config": config, "vpn_link": vpn_link}
     except Exception as e:
@@ -1609,11 +1828,19 @@ async def api_toggle_connection(request: Request, server_id: int, req: ToggleCon
         server = data["servers"][server_id]
         if not req.client_id:
             return JSONResponse({"error": "Client ID is required"}, status_code=400)
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        manager.toggle_client(req.protocol, req.client_id, req.enable)
-        ssh.disconnect()
+
+        def _toggle():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                get_protocol_manager(ssh, req.protocol).toggle_client(req.protocol, req.client_id, req.enable)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(_toggle)
         status = "enabled" if req.enable else "disabled"
         return {"status": "success", "enabled": req.enable, "message": f"Connection {status}"}
     except Exception as e:
@@ -1713,7 +1940,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
             "share_password_hash": None,
         }
         data["users"].append(new_user)
-        save_data(data)
+        await save_data_async(data)
 
         result = {"status": "success", "user_id": new_user["id"]}
 
@@ -1724,25 +1951,33 @@ async def api_add_user(request: Request, req: AddUserRequest):
                 proto_info = server.get("protocols", {}).get(req.protocol, {})
                 port = proto_info.get("port", "55424")
                 conn_name = req.connection_name or f"{req.username}_vpn"
-                ssh = get_ssh(server)
-                ssh.connect()
-                manager = get_protocol_manager(ssh, req.protocol)
-                if req.protocol == "telemt":
-                    conn_result = manager.add_client(
-                        req.protocol,
-                        conn_name,
-                        server["host"],
-                        port,
-                        telemt_quota=req.telemt_quota,
-                        telemt_max_ips=req.telemt_max_ips,
-                        telemt_expiry=req.telemt_expiry,
-                        secret=req.telemt_secret,
-                        user_ad_tag=req.telemt_ad_tag,
-                        max_tcp_conns=req.telemt_max_conns,
-                    )
-                else:
-                    conn_result = manager.add_client(req.protocol, conn_name, server["host"], port)
-                ssh.disconnect()
+
+                def _add_conn():
+                    ssh = get_ssh(server)
+                    ssh.connect()
+                    try:
+                        manager = get_protocol_manager(ssh, req.protocol)
+                        if req.protocol == "telemt":
+                            return manager.add_client(
+                                req.protocol,
+                                conn_name,
+                                server["host"],
+                                port,
+                                telemt_quota=req.telemt_quota,
+                                telemt_max_ips=req.telemt_max_ips,
+                                telemt_expiry=req.telemt_expiry,
+                                secret=req.telemt_secret,
+                                user_ad_tag=req.telemt_ad_tag,
+                                max_tcp_conns=req.telemt_max_conns,
+                            )
+                        return manager.add_client(req.protocol, conn_name, server["host"], port)
+                    finally:
+                        try:
+                            ssh.disconnect()
+                        except Exception:
+                            pass
+
+                conn_result = await asyncio.to_thread(_add_conn)
 
                 if conn_result.get("client_id"):
                     conn = {
@@ -1756,7 +1991,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
                     }
                     data = load_data()  # reload
                     data["user_connections"].append(conn)
-                    save_data(data)
+                    await save_data_async(data)
                     result["connection_created"] = True
                     if conn_result.get("config"):
                         result["config"] = conn_result["config"]
@@ -1797,13 +2032,13 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if req.password:
             user["password_hash"] = hash_password(req.password)
 
-        save_data(data)
+        await save_data_async(data)
 
         # Auto re-enable if traffic limit increased beyond usage
         if req.traffic_limit is not None:
             if new_limit > 0 and user.get("traffic_used", 0) < new_limit and not user.get("enabled", True):
                 await perform_toggle_user(data, user_id, True)
-                save_data(data)
+                await save_data_async(data)
 
         return {"status": "success"}
     except Exception as e:
@@ -1824,7 +2059,7 @@ async def api_delete_user(request: Request, user_id: str):
         success = await perform_delete_user(data, user_id)
         if not success:
             return JSONResponse({"error": "User not found"}, status_code=404)
-        save_data(data)
+        await save_data_async(data)
         return {"status": "success"}
     except Exception as e:
         logger.exception("Error deleting user")
@@ -1841,7 +2076,7 @@ async def api_toggle_user(request: Request, user_id: str, req: ToggleUserRequest
         success = await perform_toggle_user(data, user_id, req.enabled)
         if not success:
             return JSONResponse({"error": "User not found"}, status_code=404)
-        save_data(data)
+        await save_data_async(data)
         return {"status": "success", "enabled": req.enabled}
     except Exception as e:
         logger.exception("Error toggling user")
@@ -1907,7 +2142,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             }
             data = load_data()
             data["user_connections"].append(conn)
-            save_data(data)
+            await save_data_async(data)
 
         resp = {"status": "success"}
         if result.get("config"):
@@ -1972,7 +2207,7 @@ async def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Re
     elif req.password == "":  # Clear
         user["share_password_hash"] = None
 
-    save_data(data)
+    await save_data_async(data)
     return {"status": "success", "share_token": user.get("share_token")}
 
 
@@ -2051,12 +2286,21 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         server = data["servers"][sid]
         proto_info = server.get("protocols", {}).get(conn["protocol"], {})
         port = proto_info.get("port", "55424")
-        ssh = get_ssh(server)
-        ssh.connect()
-        # Use appropriate manager for the protocol
-        manager = get_protocol_manager(ssh, conn["protocol"])
-        config = manager.get_client_config(conn["protocol"], conn["client_id"], server["host"], port)
-        ssh.disconnect()
+
+        def _get_config():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                return get_protocol_manager(ssh, conn["protocol"]).get_client_config(
+                    conn["protocol"], conn["client_id"], server["host"], port
+                )
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        config = await asyncio.to_thread(_get_config)
         vpn_link = generate_vpn_link(config) if config else ""
         return {"config": config, "vpn_link": vpn_link}
     except Exception as e:
@@ -2083,12 +2327,21 @@ async def api_my_connection_config(request: Request, connection_id: str):
         server = data["servers"][sid]
         proto_info = server.get("protocols", {}).get(conn["protocol"], {})
         port = proto_info.get("port", "55424")
-        ssh = get_ssh(server)
-        ssh.connect()
-        # Use appropriate manager for the protocol (fixes Telemt/Xray not working for users)
-        manager = get_protocol_manager(ssh, conn["protocol"])
-        config = manager.get_client_config(conn["protocol"], conn["client_id"], server["host"], port)
-        ssh.disconnect()
+
+        def _get_config():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                return get_protocol_manager(ssh, conn["protocol"]).get_client_config(
+                    conn["protocol"], conn["client_id"], server["host"], port
+                )
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        config = await asyncio.to_thread(_get_config)
         vpn_link = generate_vpn_link(config) if config else ""
         return {"config": config, "vpn_link": vpn_link}
     except Exception as e:
@@ -2124,12 +2377,12 @@ async def api_get_settings(request: Request):
 #     _check_admin(request)
 #     data = load_data()
 #     data['settings'] = body.dict()
-#     save_data(data)
+#     await save_data_async(data)
 
 #     # Trigger sync if enabled
 #     if body.sync.remnawave_sync_users:
 #         await sync_users_with_remnawave(data)
-#         save_data(data)
+#         await save_data_async(data)
 
 #     return {'status': 'success'}
 
@@ -2144,7 +2397,7 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     data["settings"]["captcha"] = payload.captcha.dict()
     data["settings"]["telegram"] = payload.telegram.dict()
     data["settings"]["ssl"] = payload.ssl.dict()
-    save_data(data)
+    await save_data_async(data)
     logger.info("Settings saved (including captcha and telegram)")
 
     # Handle bot start/stop based on new telegram settings
@@ -2178,13 +2431,13 @@ async def api_telegram_toggle(request: Request):
         await tg_bot.stop_bot()
         tg_cfg["enabled"] = False
         data["settings"]["telegram"] = tg_cfg
-        save_data(data)
+        await save_data_async(data)
         return {"status": "stopped", "bot_running": False}
     else:
         tg_bot.launch_bot(token, load_data, generate_vpn_link)
         tg_cfg["enabled"] = True
         data["settings"]["telegram"] = tg_cfg
-        save_data(data)
+        await save_data_async(data)
         return {"status": "started", "bot_running": True}
 
 
@@ -2217,11 +2470,19 @@ async def api_get_server_clients(request: Request, server_id: int, protocol: str
         if server_id >= len(data["servers"]):
             return JSONResponse({"error": "Server not found"}, status_code=404)
         server = data["servers"][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, protocol)
-        clients = manager.get_clients(protocol)
-        ssh.disconnect()
+
+        def _get_clients():
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                return get_protocol_manager(ssh, protocol).get_clients(protocol)
+            finally:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        clients = await asyncio.to_thread(_get_clients)
 
         # Filter: only show clients that are not assigned to anyone in the panel
         assigned_ids = {
@@ -2274,11 +2535,11 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
         if not isinstance(backup_data["servers"], list) or not isinstance(backup_data["users"], list):
             return JSONResponse({"error": "Invalid structure: servers and users must be lists"}, status_code=400)
 
-        # Save the new data
-        async with DATA_LOCK:
-            save_data(backup_data)
+        _apply_schema_migrations(backup_data)
 
-        # In a real app we might want to restart or re-init background tasks
+        async with DATA_LOCK:
+            await asyncio.to_thread(save_data, backup_data)
+
         return {"status": "success"}
     except Exception as e:
         logger.exception("Error during restore")
