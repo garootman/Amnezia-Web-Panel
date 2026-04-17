@@ -2,14 +2,15 @@ services:
   amnezia_panel:
     image: prvtpro/amnezia-panel:1.4.2
     container_name: amnezia_panel
-    # Set PANEL_PORT to run the app on a non-default port inside the container.
-    # Set APP_PORT to publish on a different host port (defaults to PANEL_PORT).
+    # PANEL_PORT is used as both the in-container listen port and the host publish port.
+    # If you need to publish on a different host port (e.g. 5000 is taken on the host),
+    # change the left-hand side of the mapping below by hand.
     environment:
       PANEL_HOST: ${PANEL_HOST:-0.0.0.0}
       PANEL_PORT: ${PANEL_PORT:-5000}
       SECRET_KEY: ${SECRET_KEY:-}
     ports:
-      - "${APP_PORT:-${PANEL_PORT:-5000}}:${PANEL_PORT:-5000}"
+      - "${PANEL_PORT:-5000}:${PANEL_PORT:-5000}"
     volumes:
       - ./data:/app/data
     restart: unless-stopped
