@@ -14,7 +14,7 @@ wheels = [
 [[package]]
 name = "amnezia-web-panel"
 version = "1.4.2"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
@@ -24,6 +24,7 @@ dependencies = [
     { name = "multicolorcaptcha" },
     { name = "paramiko" },
     { name = "pydantic" },
+    { name = "pydantic-settings" },
     { name = "python-multipart" },
     { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
@@ -45,6 +46,7 @@ requires-dist = [
     { name = "multicolorcaptcha", specifier = ">=1.2" },
     { name = "paramiko", specifier = ">=3.5" },
     { name = "pydantic", specifier = ">=2.10" },
+    { name = "pydantic-settings", specifier = ">=2.6" },
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "starlette", specifier = ">=0.46" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
@@ -700,6 +702,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ee/b2/c28419aa9fc8055f4ac8e801d1d11c6357351bfa4321ed9bafab3eb98087/pydantic_core-2.46.2-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:fb3ec2c7f54c07b30d89983ce78dc32c37dd06a972448b8716d609493802d628", size = 1937059, upload-time = "2026-04-17T09:10:53.554Z" },
     { url = "https://files.pythonhosted.org/packages/30/ce/cd0824a2db213dc17113291b7a09b9b0ccd9fbf97daa4b81548703341baf/pydantic_core-2.46.2-graalpy312-graalpy250_312_native-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:130a6c837d819ef33e8c2bf702ed2c3429237ea69807f1140943d6f4bdaf52fa", size = 1997278, upload-time = "2026-04-17T09:12:23.784Z" },
     { url = "https://files.pythonhosted.org/packages/c9/69/47283fe3c0c967d3e9e9cd6c42b70907610c8a6f8d6e8381f1bb55f8006c/pydantic_core-2.46.2-graalpy312-graalpy250_312_native-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c2e25417cec5cd9bddb151e33cb08c50160f317479ecc02b22a95ec18f8fe004", size = 2147096, upload-time = "2026-04-17T09:12:43.124Z" },
+]
+
+[[package]]
+name = "pydantic-settings"
+version = "2.13.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/6d/fffca34caecc4a3f97bda81b2098da5e8ab7efc9a66e819074a11955d87e/pydantic_settings-2.13.1.tar.gz", hash = "sha256:b4c11847b15237fb0171e1462bf540e294affb9b86db4d9aa5c01730bdbe4025", size = 223826, upload-time = "2026-02-19T13:45:08.055Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/4b/ccc026168948fec4f7555b9164c724cf4125eac006e176541483d2c959be/pydantic_settings-2.13.1-py3-none-any.whl", hash = "sha256:d56fd801823dbeae7f0975e1f8c8e25c258eb75d278ea7abb5d9cebb01b56237", size = 58929, upload-time = "2026-02-19T13:45:06.034Z" },
 ]
 
 [[package]]

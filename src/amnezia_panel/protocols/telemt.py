@@ -5,7 +5,7 @@ import re
 import os
 import secrets
 from datetime import datetime
-from ssh_manager import SSHManager
+from ..ssh_manager import SSHManager
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,8 @@ class TelemtManager:
         self.ssh.run_sudo_command("apt-get install -y docker-buildx-plugin docker-compose-plugin || yum install -y docker-buildx-plugin docker-compose-plugin")
             
         results.append("Uploading Telemt files...")
-        local_dir = os.path.join(os.path.dirname(__file__), 'protocol_telemt')
+        # repo_root/protocol_telemt — three levels up from src/amnezia_panel/protocols/
+        local_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'protocol_telemt'))
         remote_dir = "/opt/amnezia/telemt"
         self.ssh.run_sudo_command(f"mkdir -p {remote_dir}")
         self.ssh.run_sudo_command(f"chmod 755 {remote_dir}")

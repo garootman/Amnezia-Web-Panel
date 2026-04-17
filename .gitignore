@@ -30,6 +30,9 @@ coverage.xml
 
 # User data
 data.json
+/data/
+ssl_temp/
+.env
 .DS_Store
 
 # IDEs

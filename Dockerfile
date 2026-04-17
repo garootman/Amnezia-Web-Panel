@@ -27,4 +27,4 @@ USER app
 WORKDIR /app
 VOLUME ["/app/data"]
 EXPOSE 5000
-CMD ["python", "app.py"]
+CMD ["python", "-m", "amnezia_panel"]

@@ -9,12 +9,16 @@ Do these in the order below. Each phase is independently shippable — don't try
 ## Status
 
 - [x] **Phase 1** — uv migration (`pyproject.toml`, `uv.lock`, `.python-version`, dead deps pruned; `itsdangerous` added — plan missed it, required by `SessionMiddleware`)
-- [x] **Phase 3.1** — Multistage uv Dockerfile, non-root `app` user, `/app/data` volume
+- [x] **Phase 2.1** — `src/amnezia_panel/` layout, `assets/` holds static/templates/translations, `protocols/` subpackage, `__main__.py` + `amnezia-panel` script entrypoint via hatchling
+- [x] **Phase 2.3** — Duplicate in-function manager imports consolidated to top-of-file (kept `TelemtManager`/`DNSManager` lazy to avoid cycles)
+- [x] **Phase 3.1** — Multistage uv Dockerfile, non-root `app` user, `/app/data` volume, CMD is `python -m amnezia_panel`
 - [x] **Phase 3.2** — CI rewritten: single Docker build job replaces 3-OS PyInstaller matrix; `publish` job pushes to GHCR, disabled via `if: false` until enabled
-- [x] **Configurable port/host** — `PANEL_PORT` / `PANEL_HOST` / `DATA_DIR` env vars honoured by `app.py`, Dockerfile, compose
+- [x] **Pydantic-settings** (collateral) — `config.py` replaces scattered `os.environ.get(...)` reads; `PANEL_HOST` / `PANEL_PORT` / `SECRET_KEY` / `DATA_DIR` / `ASSETS_DIR` now a single typed `Settings` object with `.env` file support
+- [x] **Configurable port/host** — env > data.json > default, honoured by package entrypoint, Dockerfile, compose
 - [x] **Partial Phase 4.5** — unreachable `return True` removed, dead `CaptchaGenerator` import fallback removed, Russian Dockerfile comments gone
 - [x] **Starlette 1.x fix** (collateral) — `TemplateResponse(request, name, ctx)` signature update, silently broken after dep upgrade
-- [ ] Phase 2 — `src/` layout + `app.py` split *(deferred — the "scary PR" per plan)*
+- [ ] Phase 2.2 — `app.py` split into `auth.py` / `data.py` / `background.py` / `sync.py` / route modules *(deferred — the 2.3k-LOC file still lives as one module under the package)*
+- [ ] Phase 2.4 — Normalize `WireGuardManager` signatures and delete `_manager_call`
 - [ ] Phase 4.1–4.4, 4.6, 4.7 — ruff wiring, `.editorconfig`, Taskfile, CHANGELOG, version from metadata
 
 ---

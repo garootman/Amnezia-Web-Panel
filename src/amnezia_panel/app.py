@@ -21,31 +21,24 @@ import httpx
 
 from multicolorcaptcha import CaptchaGenerator
 
-from ssh_manager import SSHManager
-from awg_manager import AWGManager
-from xray_manager import XrayManager
-from wireguard_manager import WireGuardManager
-import telegram_bot as tg_bot
+from . import telegram_bot as tg_bot
+from .config import settings
+from .protocols.awg import AWGManager
+from .protocols.wireguard import WireGuardManager
+from .protocols.xray import XrayManager
+from .ssh_manager import SSHManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Amnezia Web Panel")
-app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
+app.add_middleware(SessionMiddleware, secret_key=settings.secret_key)
 
-# Mount static files & templates
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
-templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+app.mount("/static", StaticFiles(directory=str(settings.assets_dir / "static")), name="static")
+templates = Jinja2Templates(directory=str(settings.assets_dir / "templates"))
 
-if getattr(sys, 'frozen', False):
-    application_path = os.path.dirname(sys.executable)
-else:
-    application_path = os.path.dirname(__file__)
-
-DATA_DIR = os.environ.get('DATA_DIR') or application_path
-os.makedirs(DATA_DIR, exist_ok=True)
-DATA_FILE = os.path.join(DATA_DIR, 'data.json')
+DATA_FILE = str(settings.data_file)
 CURRENT_VERSION = "v1.4.2"
 
 
@@ -54,7 +47,7 @@ TRANSLATIONS = {}
 
 def load_translations():
     global TRANSLATIONS
-    trans_dir = os.path.join(os.path.dirname(__file__), 'translations')
+    trans_dir = str(settings.assets_dir / 'translations')
     if os.path.exists(trans_dir):
         for f in os.listdir(trans_dir):
             if f.endswith('.json'):
@@ -129,19 +122,17 @@ def get_ssh(server):
 
 
 def get_protocol_manager(ssh, protocol: str):
+    from .protocols.telemt import TelemtManager
+    from .protocols.dns import DNSManager
+
     if protocol == 'xray':
-        from xray_manager import XrayManager
         return XrayManager(ssh)
-    elif protocol == 'telemt':
-        from telemt_manager import TelemtManager
+    if protocol == 'telemt':
         return TelemtManager(ssh)
-    elif protocol == 'dns':
-        from dns_manager import DNSManager
+    if protocol == 'dns':
         return DNSManager(ssh)
-    elif protocol == 'wireguard':
-        from wireguard_manager import WireGuardManager
+    if protocol == 'wireguard':
         return WireGuardManager(ssh)
-    from awg_manager import AWGManager
     return AWGManager(ssh)
 
 
@@ -1327,18 +1318,15 @@ async def api_server_config(request: Request, server_id: int, req: ProtocolReque
         server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
+        from .protocols.telemt import TelemtManager
         if req.protocol == 'xray':
-            from xray_manager import XrayManager
             mgr = XrayManager(ssh)
             data_json = mgr._get_server_json()
-            import json as _json
-            config = _json.dumps(data_json, indent=2, ensure_ascii=False) if data_json else ''
+            config = json.dumps(data_json, indent=2, ensure_ascii=False) if data_json else ''
         elif req.protocol == 'telemt':
-            from telemt_manager import TelemtManager
             mgr = TelemtManager(ssh)
             config = mgr._get_server_config()
         elif req.protocol == 'wireguard':
-            from wireguard_manager import WireGuardManager
             mgr = WireGuardManager(ssh)
             config = mgr._get_server_config()
         else:
@@ -1363,22 +1351,19 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
         server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
+        from .protocols.telemt import TelemtManager
         if req.protocol == 'xray':
-            from xray_manager import XrayManager
             mgr = XrayManager(ssh)
-            import json as _json
             try:
-                data_json = _json.loads(req.config)
+                data_json = json.loads(req.config)
             except Exception as e:
                 ssh.disconnect()
                 return JSONResponse({'error': f'Invalid JSON format: {str(e)}'}, status_code=400)
             mgr._save_server_json(data_json)
         elif req.protocol == 'telemt':
-            from telemt_manager import TelemtManager
             mgr = TelemtManager(ssh)
             mgr.save_server_config(req.protocol, req.config)
         elif req.protocol == 'wireguard':
-            from wireguard_manager import WireGuardManager
             mgr = WireGuardManager(ssh)
             mgr.save_server_config(req.config)
         else:
@@ -2241,46 +2226,3 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
-if __name__ == '__main__':
-    data = load_data()
-    ssl_conf = data.get('settings', {}).get('ssl', {})
-    
-    cert_file = ssl_conf.get('cert_path')
-    key_file = ssl_conf.get('key_path')
-    
-    # If text is provided, create temporary files
-    temp_dir = os.path.join(DATA_DIR, 'ssl_temp')
-    if ssl_conf.get('enabled'):
-        if ssl_conf.get('cert_text') or ssl_conf.get('key_text'):
-            if not os.path.exists(temp_dir):
-                os.makedirs(temp_dir)
-            
-            if ssl_conf.get('cert_text'):
-                cert_file = os.path.join(temp_dir, 'cert.pem')
-                with open(cert_file, 'w') as f:
-                    f.write(ssl_conf['cert_text'].strip() + '\n')
-            
-            if ssl_conf.get('key_text'):
-                key_file = os.path.join(temp_dir, 'key.pem')
-                with open(key_file, 'w') as f:
-                    f.write(ssl_conf['key_text'].strip() + '\n')
-
-    # Precedence: PANEL_PORT env > settings.ssl.panel_port > 5000
-    port = int(os.environ.get('PANEL_PORT') or ssl_conf.get('panel_port') or 5000)
-    host = os.environ.get('PANEL_HOST', '0.0.0.0')
-
-    uvicorn_kwargs = {
-        "app": app,
-        "host": host,
-        "port": port,
-    }
-    
-    if ssl_conf.get('enabled') and cert_file and key_file:
-        if os.path.exists(cert_file) and os.path.exists(key_file):
-            logger.info(f"Starting panel with HTTPS enabled on domain: {ssl_conf.get('domain')} at port {uvicorn_kwargs['port']}")
-            uvicorn_kwargs["ssl_certfile"] = cert_file
-            uvicorn_kwargs["ssl_keyfile"] = key_file
-        else:
-            logger.error("SSL certificates not found at specified paths. Starting with HTTP.")
-
-    uvicorn.run(**uvicorn_kwargs)

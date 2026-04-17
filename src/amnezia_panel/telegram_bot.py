@@ -232,11 +232,9 @@ async def _handle_get_config(
     loading_msg_id = loading_result.get("result", {}).get("message_id")
 
     try:
-        import sys, os
-        sys.path.insert(0, os.path.dirname(__file__))
-        from ssh_manager import SSHManager
-        from awg_manager import AWGManager
-        from xray_manager import XrayManager
+        from .ssh_manager import SSHManager
+        from .protocols.awg import AWGManager
+        from .protocols.xray import XrayManager
 
         ssh = SSHManager(
             server["host"],
