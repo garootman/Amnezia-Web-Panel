@@ -4,114 +4,153 @@ Scope note: these items are **not** in `RISK_AUDIT.md` because that file is scop
 
 Order of implementation suggested: (4) screen move → (3) Docker trim → (2) update checker → (1) public API (largest). This order matters: item 2 requires item 3's GHCR publishing.
 
-This document was updated after a design review. Findings from that review are captured inline under **Review findings** in each section and the **Design / Plan** sections reflect the corrected approach.
+This document was updated after a design review and a product-model pivot. Findings from that review are captured inline under **Review findings** in each section. Item 1 was rewritten around a **user-lifecycle** model (one external user → many connections, subscription-driven) instead of the flat admin-CRUD surface originally sketched.
 
 ---
 
-## 1. Public Remote API for external VPN provisioning
+## 1. Public Remote API — user-lifecycle model
 
 ### Motivation
 
-A separate product (premium tier) needs to provision AmneziaWG/WireGuard/Xray clients on demand per premium user. Today the panel only exposes session-cookie routes; there is no machine-to-machine surface. README already flags this gap.
+A separate product (main portal) sells premium subscriptions. Premium users get VPN access. The main portal's backend calls this panel to:
 
-### Requirements
+- Issue a VPN connection when a user clicks "Get VPN".
+- Let the user add more connections, rotate keys, migrate to a different server (banned location), switch protocol, or buy an extra slot.
+- Extend expiry when the subscription is renewed; suspend on expiry.
+- Read user/connection stats for the main portal's dashboard.
 
-- Caller is another backend, not a browser. No CORS, no cookies.
-- Must survive replay and body tampering on the open internet.
-- Must be **strictly additive**: do not touch the existing session-authed routes or the Swagger surface shape for the panel UI.
-- Key revocation must not require a restart.
+The panel also keeps its existing admin UI (one admin, many users managed through the panel directly), and adds a new **Users** tab + stats page that mirror what the API exposes.
 
-### Review findings
+### Product shape — decisions captured
 
-1. **Argon2/PBKDF2 for secret hashing is wrong here.** Those KDFs are deliberately slow (100 ms–1 s). Applied per-request they block a worker thread before any business logic runs. For a machine-to-machine HMAC scheme the secret is already high-entropy random — a KDF buys nothing. Store the secret as-is and compare with `hmac.compare_digest`.
-2. **The rate limiter cannot share state with `_LOGIN_FAILURES` (app.py:1038).** That dict is per-IP exponential backoff; what we need is a per-key token bucket. Different algorithm, different state. Keep them separate.
-3. **30 req/s per key is meaningless for writes.** SSH round-trips are 200 ms–2 s, so writes naturally serialize to 1–5 req/s per server. Rate limiting mostly matters for read endpoints.
-4. **Idempotency storage in `data.json` is a landmine.** `save_data` (app.py:136) rewrites the entire JSON document on every call, under `DATA_LOCK`. Storing response bodies there would make it unbounded and serialize every write behind the traffic loop. Keep idempotency state in-process only; a restart-and-retry model is acceptable for v1.
-5. **Scopes are over-engineered for v1.** One caller, one scope. Ship the `scopes` field in the schema so it's migratable; enforce only revocation in v1 code.
-6. **`server_id` is an array index (app.py:1156), not a stable id.** Deleting server 1 shifts server 2 into its slot — any cached `server_id` in the external backend now silently points at the wrong server. Must be fixed before the API ships: add a UUID to each server record, key the API off that.
-7. **`POST /clients` is not atomically idempotent even with the header.** If SSH succeeds and `save_data_async` fails (or the process dies between the two), the VPN server has a client the panel doesn't know about. This is a pre-existing flaw in `api_add_connection` (app.py:1636). Document as a known limitation: on 5xx, callers must `GET /clients/{id}` before retrying.
-8. **`DATA_LOCK` is a single asyncio.Lock shared with the traffic loop.** Not a v1 blocker, but document that external API writes contend with the 10-min scrape loop on slow disks.
-9. **`load_data()` runs on every request with no cache.** `require_api_key` reads `data.json` off disk before any business logic. Fine for tens of KB; worth revisiting if usage grows.
-10. **The external API widens the SSH-credentials blast radius.** SSH passwords are stored plaintext in `data.json` (app.py:1134). A leaked API key is equivalent to a leaked admin password. Document IP-allowlisting at the reverse proxy as **strongly recommended, not optional**.
+| Decision                         | Choice                                                                                   |
+| -------------------------------- | ---------------------------------------------------------------------------------------- |
+| User → connection cardinality    | 1 user → many connections                                                                |
+| Expiry source of truth           | User-level `expires_at`; connections inherit                                             |
+| Prolong                          | `PATCH /users/{id}` with absolute `expires_at` (no relative-days endpoint)               |
+| On expiry                        | Suspend (disable connections, keep records); hard-delete after 90-day grace              |
+| Server selection                 | Caller may specify; otherwise panel picks least-loaded within optional region hint        |
+| Telegram SOCKS                   | Not in v1 (built-in Amnezia SOCKS deferred); MTProto via existing `telemt_manager.py`    |
+| Webhooks                         | Per API key; HMAC-signed; in-memory retry queue                                          |
+| Traffic limits                   | Per connection (main portal sets equal values if it wants a user-level cap)              |
 
-### Design
+### Review findings (from design pass on the previous draft)
 
-**Transport:** same process, new router mounted at `/api/v1/ext/*`. Shared FastAPI app, shared `data.json`, shared SSH/manager pipeline via `get_protocol_manager` + `_manager_call`. Separate auth dependency (`require_api_key`) — never composes with `get_current_user`.
+1. **Argon2/PBKDF2 for API secret hashing is wrong.** KDFs block a worker thread for 100 ms–1 s per request. For an HMAC scheme with a random high-entropy secret, KDFs buy nothing. Store secrets as-is, compare with `hmac.compare_digest`.
+2. **Rate limiter cannot share state with `_LOGIN_FAILURES` (app.py:1038).** Different algorithm (per-IP exponential backoff vs. per-key token bucket). Separate dicts.
+3. **Idempotency storage in `data.json` is unsafe.** `save_data` (app.py:136) rewrites the whole file under `DATA_LOCK`. Persisting response bodies makes the file unbounded and serializes all writers. Keep idempotency state in-process; restart drops it (documented).
+4. **`server_id` is an array index (app.py:1156), not stable.** Delete server 1 and server 2 shifts to slot 1; any cached caller now points at the wrong server silently. Introduce `servers[].id` UUID before the API ships.
+5. **`POST` is not atomically idempotent with persistence.** SSH-then-save is two steps; a crash between them leaves the VPN server with a client the panel doesn't know. Document: callers must `GET` before retrying on 5xx.
+6. **Scopes are over-engineered for v1.** Ship the `scopes` field in the schema for migratability; enforce only revocation in v1 code.
+7. **`load_data()` per request has no cache.** Fine at current data volume (tens of KB); revisit if API load grows.
+8. **SSH credentials blast radius.** SSH passwords live plaintext in `data.json` (app.py:1134). A leaked API key ≡ leaked admin password. README **must mandate** reverse-proxy IP allowlisting, not merely suggest.
+9. **Scope creep risk.** "External config download endpoint" duplicates the existing share-link flow. Use share tokens; don't build a parallel path.
 
-**File placement:** new module `src/amnezia_panel/ext_api.py` exporting an `APIRouter(prefix="/api/v1/ext")`. Mounted on `app` in `app.py` after existing routes. `app.py` is already 2.5k LOC; do not add routes there directly.
+### Data model
 
-**Auth:** HMAC-SHA256 signed requests. Symmetric key, simple for the caller to integrate.
-
-Headers required on every request:
-
-| Header         | Value                                                                         |
-| -------------- | ----------------------------------------------------------------------------- |
-| `X-API-Key`    | Key id (public part — looked up server-side)                                  |
-| `X-Timestamp`  | Unix seconds, integer                                                         |
-| `X-Signature`  | `hex(HMAC_SHA256(secret, f"{ts}\n{method}\n{path}\n{sha256(body)}"))`         |
-
-Server-side checks (in order, constant-time where relevant):
-1. `abs(now - ts) <= 300` (5-min window, rejects replay).
-2. Key id resolves to an active, non-revoked record in `data.json → api_keys[]`.
-3. HMAC matches with `hmac.compare_digest`. **No KDF on the stored secret** — it is random high-entropy material, compared directly.
-4. Per-key token bucket: **60 req/min for reads, 10 req/min for writes**. Separate bucket from `_LOGIN_FAILURES`, stored in a module-level dict `_API_RATE: dict[str, tuple[float, float]]` (key_id → (last_check, tokens)). Returns `429` on exhaustion.
-5. Scope field is stored and returned but not enforced in v1 (see finding 5).
-
-**Key record shape** (new in `data.json`, migration in `_apply_schema_migrations`):
+Three new top-level keys in `data.json`, one FK added to an existing structure.
 
 ```json
 {
+  "external_users": [
+    {
+      "external_id": "portal_user_42",     // caller-supplied stable ID; primary key
+      "label": "user@example.com",          // optional, for admin UI
+      "expires_at": "2026-05-01T00:00:00Z",
+      "status": "active",                   // active | expired | suspended
+      "created_at": "…",
+      "updated_at": "…",
+      "expiring_soon_notified_at": null     // idempotency marker for webhooks
+    }
+  ],
+
+  "user_connections": [
+    {
+      "id": "…",                            // existing
+      "external_user_id": "portal_user_42", // NEW FK (nullable for legacy panel-created connections)
+      "server_id": "srv_uuid",              // NEW: now a UUID from servers[].id
+      "protocol": "wireguard",
+      "traffic_limit": 107374182400,
+      "traffic_used": 0,
+      "enabled": true,
+      "label": null,
+      "created_at": "…"
+    }
+  ],
+
   "api_keys": [
     {
-      "id": "ak_live_…",            // public, sent in X-API-Key
-      "secret": "hex64…",           // random 32-byte hex, shown once at creation
-      "scopes": ["full"],           // reserved for v2; v1 treats any non-revoked key as full
-      "label": "premium-backend prod",
+      "id": "ak_live_…",                    // public; sent in X-API-Key
+      "secret": "hex64…",                   // random 32-byte hex; shown once at creation
+      "scopes": ["full"],                   // reserved; v1 treats any non-revoked key as full
+      "label": "main-portal prod",
       "created_at": "…",
       "revoked": false,
-      "last_used_at": null
+      "last_used_at": null,
+      "webhook": {                          // per-key webhook config (finding: per-key chosen)
+        "url": "https://portal.example.com/vpn-webhook",
+        "secret": "hex64…",
+        "events": ["user.expired", "connection.quota_exhausted", …]
+      }
     }
   ]
 }
 ```
 
-Migration snippet (add to `_apply_schema_migrations`):
-```python
-if "api_keys" not in data:
-    data["api_keys"] = []
-    changed = True
-```
+Existing `data.users` (panel admins) is unrelated and unrenamed. `external_users` is deliberately named to avoid collision.
 
-**Prerequisite migration — stable server IDs (finding 6):**
+### Schema migrations (add to `_apply_schema_migrations`)
+
 ```python
+# 1. External users table
+if "external_users" not in data:
+    data["external_users"] = []
+    changed = True
+
+# 2. Stable UUIDs on servers (prerequisite for the API, finding 4)
 for srv in data.get("servers", []):
     if "id" not in srv:
         srv["id"] = str(uuid.uuid4())
         changed = True
+    if "region" not in srv:
+        srv["region"] = ""                   # free-form tag; e.g. "eu-west", "us-east"
+        changed = True
+
+# 3. API keys
+if "api_keys" not in data:
+    data["api_keys"] = []
+    changed = True
+
+# 4. Existing connections: external_user_id defaults to null
+for conn in data.get("user_connections", []):
+    conn.setdefault("external_user_id", None)
 ```
-Also update `user_connections[].server_id` references during the same migration pass if any are still integer indices. External API endpoints key off `srv["id"]`; the internal UI can continue using indices for now.
 
-**Endpoints (v1):**
+Internal panel UI keeps using integer indices where it already does; API endpoints key off `servers[].id` exclusively.
 
-| Method | Path                                 | Scope (reserved) | Purpose                                         |
-| ------ | ------------------------------------ | ---------------- | ----------------------------------------------- |
-| GET    | `/api/v1/ext/servers`                | servers:read     | List servers (UUID + installed protocols)       |
-| POST   | `/api/v1/ext/clients`                | clients:write    | Provision client (server_id, protocol, limits)  |
-| GET    | `/api/v1/ext/clients/{id}`           | clients:read     | Status + traffic counters                       |
-| PATCH  | `/api/v1/ext/clients/{id}`           | clients:write    | Update expiration / traffic_limit / enabled     |
-| DELETE | `/api/v1/ext/clients/{id}`           | clients:write    | Revoke                                          |
+### Transport & auth
 
-**Cut: `GET /clients/{id}/config`.** Duplicates the existing share-link mechanism. Return a share token URL from `POST /clients` and let the caller forward it.
+- New module `src/amnezia_panel/ext_api.py` exporting `APIRouter(prefix="/api/v1/ext")`. Mount on `app` after existing routes. `app.py` stays under its current size.
+- Same process, same `data.json`, same SSH pipeline (`get_protocol_manager` + `_manager_call`). Never compose with `get_current_user`.
 
-All endpoints return JSON. Writes accept an optional `Idempotency-Key` header backed by an in-process dict:
-```python
-_IDEMPOTENCY: dict[str, tuple[float, int, bytes]] = {}  # key -> (expires_at, status, body)
-```
-TTL = 24 h, cleaned lazily on lookup. **Does not survive restarts** — documented, not stored to disk.
+**HMAC-SHA256 signed requests.** Required headers:
 
-**Provisioning flow** for `POST /api/v1/ext/clients`: reuse `_manager_call(manager, "add_client", protocol, …)`, wrap in `asyncio.to_thread` per CLAUDE.md, persist via `save_data_async`, return the manager-generated config plus a share token URL so the caller can forward it.
+| Header         | Value                                                                 |
+| -------------- | --------------------------------------------------------------------- |
+| `X-API-Key`    | Key ID (public part)                                                  |
+| `X-Timestamp`  | Unix seconds (integer)                                                |
+| `X-Signature`  | `hex(HMAC_SHA256(secret, f"{ts}\n{method}\n{path}\n{sha256(body)}"))` |
 
-**Auth dependency sketch** (the corrected shape — no KDF, constant-time, in-process rate limit):
+Server-side checks, in order:
+
+1. `abs(now - ts) <= 300`.
+2. Key ID resolves to a non-revoked record.
+3. HMAC matches via `hmac.compare_digest`. **No KDF on the stored secret.**
+4. Per-key token bucket: 60 req/min read, 10 req/min write. Module-level dict, not sharing `_LOGIN_FAILURES` state.
+5. `scopes` stored but not enforced in v1.
+
+Auth dependency sketch:
+
 ```python
 async def require_api_key(request: Request) -> dict:
     key_id = request.headers.get("X-API-Key", "")
@@ -142,24 +181,166 @@ async def require_api_key(request: Request) -> dict:
     return key
 ```
 
-**Admin UX:** new section in `settings.html` to mint keys. On mint, show the full secret once with a copy button; store it in `data.json` as-is (consistent with how SSH passwords are already stored — finding 10). List / revoke thereafter.
+### API surface (v1)
 
-**Network exposure:**
-- Default: same port as panel. Recommend TLS (already supported via `settings.ssl`).
-- README integration section **must state**: treat the key as equivalent to admin credentials; IP-allowlist at the reverse proxy.
-- Do **not** add a second listener — keep single-process model intact.
+All paths under `/api/v1/ext`. All JSON. All writes accept optional `Idempotency-Key` header backed by in-process dict (TTL 24 h, no disk).
 
-**Non-goals for v1:** OAuth, webhooks, pagination cursors, SDK packages, scope enforcement, config-download endpoint, disk-persisted idempotency. Ship the smallest safe surface first.
+**Users**
+
+| Method | Path                         | Purpose                                                   |
+| ------ | ---------------------------- | --------------------------------------------------------- |
+| POST   | `/users`                     | Upsert by `external_id`. `{external_id, expires_at, label?}` |
+| GET    | `/users`                     | Paginated. `?status=&expiring_before=&page=&limit=`        |
+| GET    | `/users/{external_id}`       | User + connection summary                                 |
+| PATCH  | `/users/{external_id}`       | `{expires_at?, label?, status?}` (absolute values)        |
+| DELETE | `/users/{external_id}`       | Cascade delete all their connections                      |
+
+**Connections** (nested under user)
+
+| Method | Path                                                | Purpose                                                      |
+| ------ | --------------------------------------------------- | ------------------------------------------------------------ |
+| POST   | `/users/{external_id}/connections`                  | Issue. `{protocol, server_id?, region?, traffic_limit?, label?}`. Omitted `server_id` → panel picks. Returns `{id, config_url, server, protocol, …}` |
+| GET    | `/users/{external_id}/connections`                  | List                                                         |
+| GET    | `/users/{external_id}/connections/{id}`             | Detail + live stats                                          |
+| PATCH  | `/users/{external_id}/connections/{id}`             | `{traffic_limit?, label?, enabled?}`                         |
+| DELETE | `/users/{external_id}/connections/{id}`             | Revoke                                                       |
+| POST   | `/users/{external_id}/connections/{id}/rotate`      | New keys, same server + protocol                             |
+| POST   | `/users/{external_id}/connections/{id}/migrate`     | Move to different server; implicit rotate. `{server_id?, region?}` |
+
+**Flat lookup** (for webhook consumers):
+
+| Method | Path                  | Purpose                                       |
+| ------ | --------------------- | --------------------------------------------- |
+| GET    | `/connections/{id}`   | Reverse lookup; returns connection + user ref |
+
+**Servers & stats**
+
+| Method | Path                               | Purpose                                                            |
+| ------ | ---------------------------------- | ------------------------------------------------------------------ |
+| GET    | `/servers`                         | List. Returns `{id, label, region, protocols[], active_connections, reachable}` |
+| GET    | `/stats/summary`                   | `{active_users, total_users, total_connections, traffic_24h_bytes, per_server[]}` |
+| GET    | `/users/{external_id}/stats`       | Aggregate bytes + per-connection breakdown                          |
+
+**Webhook management**
+
+| Method | Path         | Purpose                                                |
+| ------ | ------------ | ------------------------------------------------------ |
+| PUT    | `/webhooks`  | Set `{url, secret, events[]}` on the caller's API key  |
+| GET    | `/webhooks`  | Read current config                                    |
+| DELETE | `/webhooks`  | Clear                                                  |
+
+**Cut from v1** (deferred):
+- Standalone config-download endpoint — returned inline as `config_url` (share token) from `POST /connections`.
+- OAuth, SDK packages, cursor pagination (offset/limit is enough for expected scale).
+- Scope enforcement.
+
+### Server selection logic
+
+When `POST /connections` omits `server_id`:
+
+1. Filter servers where `reachable == true` and the requested `protocol` is installed.
+2. If `region` is provided, filter to matching region; if empty set, fall back to any region.
+3. Rank by ascending `active_connections` (simple load proxy; no bandwidth weighting in v1).
+4. Break ties randomly.
+5. Empty candidate set → `503` with structured error `{code: "no_server_available", region, protocol}`.
+
+`reachable` is updated by the existing 10-min background loop (`periodic_background_tasks`). On SSH failure during scrape, mark `reachable=false` and fire `server.unreachable` webhook once per transition.
+
+### Webhooks
+
+**Delivery:** `POST` to the configured URL with headers `X-Webhook-Timestamp`, `X-Webhook-Signature` (`hex(HMAC_SHA256(webhook_secret, f"{ts}\n{sha256(body)}"))`), body is event JSON.
+
+**Retries:** 3 attempts with backoff 1 s → 10 s → 60 s. Queue is an in-memory `asyncio.Queue` with a single consumer task launched from `startup()`. Failed deliveries after 3 attempts are logged; **no disk persistence in v1**. Process restart drops the queue — documented.
+
+**Events:**
+
+| Event                           | Fired when                                                                 |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| `user.expiring_soon`            | `expires_at` within 7 days; fired once (idempotency via `expiring_soon_notified_at`) |
+| `user.expired`                  | `expires_at` passed; user transitioned to `expired` by the sweeper          |
+| `user.suspended`                | Manually set `status=suspended` via `PATCH`                                 |
+| `connection.provisioned`        | Successful `POST /connections`                                              |
+| `connection.rotated`            | `POST /rotate` succeeded                                                    |
+| `connection.migrated`           | `POST /migrate` succeeded                                                   |
+| `connection.quota_exhausted`    | Existing auto-disable path in `periodic_background_tasks`                   |
+| `connection.revoked`            | `DELETE` succeeded                                                          |
+| `server.unreachable`            | SSH scrape failed on a previously reachable server                          |
+
+Payload shape (example):
+
+```json
+{
+  "event": "user.expired",
+  "ts": 1775472000,
+  "data": {
+    "external_id": "portal_user_42",
+    "expired_at": "2026-05-01T00:00:00Z",
+    "connections_suspended": ["conn_uuid1", "conn_uuid2"]
+  }
+}
+```
+
+### Expiry & suspension flow
+
+`periodic_background_tasks()` already runs every 10 min. Extend it:
+
+1. Walk `external_users`. For each with `status == "active"` and `expires_at <= now`:
+   - Set `status = "expired"`.
+   - For each of their `user_connections`: set `enabled = false`; call `_manager_call(manager, "disable_client", …)` via `asyncio.to_thread`.
+   - Fire `user.expired`.
+2. For each with `status == "active"` and `expires_at` within 7 days, `expiring_soon_notified_at` null:
+   - Fire `user.expiring_soon`; set `expiring_soon_notified_at`.
+3. For each with `status == "expired"` and `expires_at` + 90 d < now:
+   - Cascade-delete user and their connections (real revoke on SSH side).
+4. Extending `expires_at` via `PATCH`:
+   - If old status was `expired`, re-enable all connections, reset `status = "active"`, clear `expiring_soon_notified_at`.
+
+All state transitions go through `save_data_async` behind `DATA_LOCK`.
+
+### Admin UI additions
+
+New **Users** tab in the panel (separate from the existing panel-admin accounts UI):
+
+- Table columns: `external_id` | `label` | `status` | `expires_at` | `# connections` | `total GB used` | actions.
+- Filter by status / expiry / free-text search on label + external_id.
+- Drill-down: connection list per user, with per-connection actions (rotate, migrate, revoke).
+- Add-user and manual-extend controls for the admin who's managing users directly without going through the main portal API.
+
+**Stats page**: totals strip (active users, total connections, 24 h traffic) + per-server load bars. Reuses `/stats/summary` endpoint internally via session auth (not HMAC).
+
+**Settings → API Keys** section:
+- Mint key: `{label}` → returns `{id, secret}` shown once with a copy button.
+- List keys: id, label, created, last_used, revoke button.
+- Per-key webhook block: URL, secret (generate or paste), event checkboxes, "send test event" button.
+
+**Server row:** add `region` field (editable), shown alongside existing columns.
+
+### Non-atomicity & caller contract
+
+`POST /connections` is not atomically idempotent: the SSH side can succeed while the subsequent `save_data_async` fails. Documented contract:
+
+- On HTTP 5xx from a write endpoint, the caller **must** `GET /connections/{id}` (if ID was returned) or `GET /users/{external_id}/connections` before retrying.
+- `Idempotency-Key` replays the stored response body within 24 h of the first successful response; does not protect against process restart.
+
+### Network exposure
+
+- Same port as panel; TLS via existing `settings.ssl`.
+- README integration section **must** state: treat API keys as equivalent to admin credentials; **mandatory** IP allowlisting at reverse proxy.
+- No second listener.
 
 ### Acceptance
 
-- [ ] `api_keys` and `servers[].id` migrations run on existing installs, idempotent.
-- [ ] HMAC verification rejects: stale ts, wrong body hash, revoked key, missing header.
-- [ ] Rate limiter drops over-limit requests with `429` (60/min read, 10/min write).
-- [ ] Idempotency-Key replays within 24h return the stored response; process restart resets the store (documented).
-- [ ] End-to-end test (real SSH, real panel): caller provisions → reads traffic → patches expiry → deletes.
-- [ ] Integration docs with a 30-line Python example caller and an explicit IP-allowlist recommendation.
-- [ ] `POST /clients` 5xx path documented: "requery before retry, provisioning is not atomic with persistence."
+- [ ] Migrations run idempotently on existing installs: `external_users`, `servers[].id`, `servers[].region`, `api_keys`, `user_connections[].external_user_id`.
+- [ ] HMAC dependency rejects: missing headers, stale `ts`, wrong body hash, revoked key.
+- [ ] Rate limiter: 60/min reads, 10/min writes; 429 on exhaustion; separate state from `_LOGIN_FAILURES`.
+- [ ] `Idempotency-Key` replays within 24 h; process restart clears; behavior documented.
+- [ ] Server-selection fallback: empty region → any region; no match → 503 with structured error.
+- [ ] Expiry sweeper: transitions `active → expired`, disables connections, fires `user.expired`; 7-day `expiring_soon` fires once; 90-day grace deletes.
+- [ ] `PATCH /users` re-enables connections when extending a previously expired user.
+- [ ] Webhook delivery: HMAC-signed, 3 retries with backoff, in-memory queue, no disk persistence; all 9 events listed above fire at the right trigger.
+- [ ] Admin UI: Users tab with table + drill-down; API-keys section with mint/revoke; webhook config with test-send button; servers table shows `region`.
+- [ ] End-to-end test (real SSH, real panel): mint key → create external user → provision connection → read stats → migrate → rotate → PATCH expiry → let expiry pass → confirm webhooks and suspension → restore.
+- [ ] README integration section with a 30–40 line Python caller example and mandatory IP-allowlist guidance.
 
 ---
 
@@ -177,22 +358,14 @@ async def require_api_key(request: Request) -> dict:
 
 ### Review findings
 
-1. **GHCR `tags/list` is the wrong source.** It returns a flat list of tag strings (including `latest`, `main`, SHAs). It has no `published_at`, no release notes URL, and requires client-side semver sorting. The original plan also called GitHub for notes metadata — so it was two APIs for what one API already returns. **Use GitHub releases exclusively.** GHCR publishing (item 3 step 5) is still required, just not as the version-check source.
-2. **`/api/internal/version-check` violates naming convention.** No other route uses `/api/internal/`. Use `/api/version`.
-3. **Dev builds break comparison.** `CURRENT_VERSION == "v0.0.0-dev"` when the package is not installed (app.py:68). Direct string comparison always shows "update available". The endpoint must short-circuit this.
-4. **`functools.lru_cache` is the wrong primitive** — no TTL. Use explicit module-level cache variables.
-
-### Target behaviour
-
-Passive info strip in Settings:
-
-> Running `v1.4.2`. Latest release: `v1.5.0` (2026-03-12). [release notes]
-
-No download button. No automatic action. If up-to-date: "You're on the latest release." If dev build: "Development build; version check skipped."
+1. **GHCR `tags/list` is the wrong source.** Flat list of tag strings, no `published_at`, no notes URL, requires client-side semver sorting. Use GitHub releases exclusively. GHCR publishing (item 3 step 5) is still required for the image registry, just not as the version-check source.
+2. **`/api/internal/version-check` violates naming convention.** Rename to `/api/version`.
+3. **Dev builds break comparison.** `CURRENT_VERSION == "v0.0.0-dev"` (app.py:68) always reports "update available" against any real tag. Short-circuit it.
+4. **`functools.lru_cache` has no TTL.** Use explicit module-level cache variables.
 
 ### Design
 
-Endpoint `GET /api/version` (session-authed, admin-only via `_check_admin`).
+Endpoint `GET /api/version` (session-authed; admin-only via `_check_admin`).
 
 ```python
 _version_cache: dict | None = None
@@ -234,14 +407,14 @@ Template change in `settings.html`: remove `id="checkUpdateBtn"`, `id="downloadU
 
 ### Fallback
 
-If the GitHub API fails or times out: render "Version check unavailable" in muted text and `logger.debug` once. Never block page render, never toast.
+GitHub API fails or times out → "Version check unavailable" in muted text; `logger.debug` once. Never block page render, never toast.
 
 ### Acceptance
 
 - [ ] No "Download" / "Check" button in Settings.
 - [ ] Version strip loads on page open without user action.
 - [ ] Dev builds render "Development build; version check skipped" with no outbound call.
-- [ ] Failure mode is silent (no toast, no error banner).
+- [ ] Failure mode silent (no toast, no error banner).
 - [ ] Cache respected — second page load within an hour issues zero outbound HTTP.
 
 ---
@@ -250,36 +423,36 @@ If the GitHub API fails or times out: render "Version check unavailable" in mute
 
 ### Current state
 
-`Dockerfile` is already two-stage (`uv` builder → `python:3.12-slim-bookworm`). Image size is dominated by: full slim-bookworm base (~80 MB), the venv including tests and wheel metadata, and paramiko/cryptography's bundled shared libs.
+`Dockerfile` is already two-stage (`uv` builder → `python:3.12-slim-bookworm`). Image size is dominated by: slim-bookworm base (~80 MB), the venv including tests and wheel metadata, and paramiko/cryptography's bundled shared libs.
 
 ### Review findings
 
-1. **The proposed `__pycache__` cleanup is counterproductive.** `UV_COMPILE_BYTECODE=1` is set (Dockerfile:3). The `__pycache__` dirs contain pre-compiled `.pyc` files. Deleting them forces recompilation on first import in the container. **Cut this step.** Instead, strip `*.dist-info` directories (wheel metadata, several MB) and vendored `test*` directories inside site-packages — both safe.
-2. **Distroless has a hard Python-version blocker.** `gcr.io/distroless/python3-debian12:nonroot` ships Python **3.11**. `pyproject.toml` requires `>=3.12`. The `:debug` tag ships newer Python but also ships busybox, defeating the security argument. Verify with `docker run --rm gcr.io/distroless/python3-debian12:nonroot python3 --version` before committing any distroless work. If 3.11, stay on `python:3.12-slim-bookworm`.
-3. **cryptography/paramiko link against bundled OpenSSL, not system OpenSSL.** So the plan's concern about distroless glibc linkage is a non-issue. The real compatibility wall is the Python version.
-4. **The `.dockerignore` audit is already done.** `docs/` is excluded; `screen/` is excluded (line 21); after item 4's move the `screen/` entry becomes a harmless no-op. Nothing to change there.
-5. **`COPY --from=builder /app /app` brings along `pyproject.toml`, `uv.lock`, `CHANGELOG.md`, `CONTRIBUTING.md`, `LICENSE`** — small but unnecessary. Split into explicit COPY lines for `.venv/`, `src/`, and `assets/`.
+1. **Proposed `__pycache__` cleanup is counterproductive.** `UV_COMPILE_BYTECODE=1` is set (Dockerfile:3). `__pycache__` dirs contain pre-compiled `.pyc`. Deleting them forces recompilation at container start. Cut this step. Strip `*.dist-info` and vendored `test*` directories instead — both safe.
+2. **Distroless has a Python-version blocker.** `gcr.io/distroless/python3-debian12:nonroot` ships Python 3.11; `pyproject.toml` requires `>=3.12`. `:debug` tag has newer Python but also busybox, defeating the security argument. Verify before committing: `docker run --rm gcr.io/distroless/python3-debian12:nonroot python3 --version`. If 3.11, stay on `python:3.12-slim-bookworm`.
+3. **cryptography/paramiko link against bundled OpenSSL**, not system OpenSSL. Plan's concern about distroless glibc linkage is a non-issue; the real wall is the Python version.
+4. **`.dockerignore` audit already correct.** `docs/` excluded; `screen/` excluded (line 21). After item 4's move, the `screen/` line becomes a harmless no-op.
+5. **`COPY --from=builder /app /app` brings `pyproject.toml`, `uv.lock`, `CHANGELOG.md`, `CONTRIBUTING.md`, `LICENSE`** into the final image. Split into explicit COPY lines for `.venv/`, `src/`, `assets/`.
 
 ### Plan (revised)
 
-1. **Measure baseline** — `docker image ls` after a clean build; record the number in the PR description.
-2. **`.dockerignore` audit** — done, no change needed. After item 4's move, optionally drop the dangling `screen/` line as cleanup.
-3. **Safe venv trimming in builder** (replaces the counterproductive `__pycache__` step):
+1. Measure baseline with `docker image ls` after a clean build; record in the PR description.
+2. `.dockerignore` audit — done. Optionally drop dangling `screen/` line post-item-4.
+3. Safe venv trimming in builder:
    ```dockerfile
    RUN find /app/.venv -name '*.dist-info' -type d -exec rm -rf {} + \
     && find /app/.venv/lib -type d -name 'tests' -prune -exec rm -rf {} + \
     && find /app/.venv/lib -type d -name 'test' -prune -exec rm -rf {} +
    ```
-   Do **not** delete `__pycache__`.
-4. **Selective COPY in final stage:**
+   **No** `__pycache__` deletion.
+4. Selective COPY in the final stage:
    ```dockerfile
    COPY --from=builder --chown=app:app /app/.venv /app/.venv
    COPY --from=builder --chown=app:app /app/src /app/src
    COPY --from=builder --chown=app:app /app/assets /app/assets
    ```
-   instead of `COPY --from=builder --chown=app:app /app /app`.
-5. **Distroless investigation (time-boxed).** Run the Python-version check above. If 3.12 is available on a tagged distroless image, prototype on a branch and verify `import paramiko, cryptography` + healthcheck passes. Otherwise abandon distroless for this cycle.
-6. **GHCR publish** — required by item 2 anyway:
+   Replace the current `COPY --from=builder --chown=app:app /app /app`.
+5. Distroless investigation — time-boxed. Run the Python-version check above. If 3.12 is available on a tagged distroless image, prototype on a branch and verify `import paramiko, cryptography` + healthcheck passes. Otherwise abandon for this cycle.
+6. GHCR publish — required by item 2 anyway:
    ```yaml
    - uses: docker/login-action@v3
      with:
@@ -293,15 +466,15 @@ If the GitHub API fails or times out: render "Version check unavailable" in mute
          prvtpro/amnezia-panel:${{ github.ref_name }}
          ghcr.io/prvtpro/amnezia-panel:${{ github.ref_name }}
    ```
-7. Alpine is not worth it here (musl wheel story for cryptography/paramiko). Skipped.
+7. Alpine — skipped (musl wheel story for cryptography/paramiko).
 
 ### Acceptance
 
-- [ ] Final image size reduced vs baseline (target: ≥15% with slim-bookworm + trimming alone; ≥30% if distroless works).
-- [ ] Container boots, serves `/`, passes the existing healthcheck.
+- [ ] Final image reduced vs baseline (target: ≥15% with slim-bookworm + trimming; ≥30% if distroless works).
+- [ ] Container boots, serves `/`, passes existing healthcheck.
 - [ ] No `__pycache__` deletion in the Dockerfile.
-- [ ] Final image contains only `.venv/`, `src/`, `assets/` (no `pyproject.toml`, `uv.lock`, `CHANGELOG.md`, `LICENSE`, `CONTRIBUTING.md`).
-- [ ] GHCR tag is published alongside Docker Hub from the same build workflow.
+- [ ] Final image contains only `.venv/`, `src/`, `assets/`.
+- [ ] GHCR tag published alongside Docker Hub from the same build workflow.
 
 ---
 
@@ -313,19 +486,19 @@ Project root should hold source and config, not marketing assets. `docs/` alread
 
 ### Review findings
 
-1. **README URL update must be atomic with the `git mv`** — the current URLs use raw `main/screen/…` GitHub paths and will 404 the instant the move lands. Single commit, no two-step.
-2. **`.dockerignore` already excludes `docs/` (line 18).** The `screen/` line on 21 becomes a harmless no-op after the move; either leave it or delete as cleanup, but no functional change is required.
-3. **No other references to `screen/` exist outside README and `.dockerignore`** (confirmed by grep — no template, Python, or workflow references).
+1. **README URL update must be atomic with the `git mv`.** Current URLs are raw `main/screen/…` GitHub paths; they 404 the instant the move lands. Single commit.
+2. **`.dockerignore` already excludes `docs/` (line 18).** The `screen/` line on 21 becomes a no-op post-move; either leave or remove as cleanup.
+3. **No other references to `screen/`** exist outside README and `.dockerignore` (confirmed by grep).
 
 ### Changes
 
 - `git mv screen/ docs/screen/`.
-- In the same commit: update `README.md` lines 20, 30, 38 from `main/screen/…` → `main/docs/screen/…`. Keep absolute URLs so images render on PyPI / GHCR / Docker Hub descriptions.
-- `.dockerignore:21` — optional cleanup: drop the now-stale `screen/` entry.
+- Same commit: update `README.md` lines 20, 30, 38 from `main/screen/…` → `main/docs/screen/…`. Keep absolute URLs.
+- `.dockerignore:21` — optional cleanup: drop the stale `screen/` entry.
 - Final grep for stray `screen/` references before committing.
 
 ### Acceptance
 
 - [ ] No `screen/` directory at repo root.
-- [ ] README images still render on github.com (verify by viewing the commit on github.com after push).
-- [ ] Docker build context does not include the screenshots (`docs/` is already ignored).
+- [ ] README images still render on github.com (verify on the commit view after push).
+- [ ] Docker build context does not include screenshots (`docs/` already ignored).
