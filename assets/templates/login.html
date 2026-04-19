@@ -111,20 +111,6 @@
                         <input class="form-input" type="password" id="password" placeholder="••••••••" required>
                     </div>
 
-                    {% if captcha_settings.enabled %}
-                    <div class="form-group">
-                        <label class="form-label">{{ _('captcha') }}</label>
-                        <div
-                            style="display: flex; margin-bottom: var(--space-xs); border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-color);">
-                            <img id="captchaImage" src="/api/auth/captcha" alt="Captcha"
-                                style="width: 100%; height: 65px; object-fit: cover; object-position: center; cursor: pointer; background: #fff;"
-                                onclick="refreshCaptcha()" title="{{ _('captcha_hint') }}">
-                        </div>
-                        <input class="form-input" type="text" id="captcha" placeholder="{{ _('captcha_placeholder') }}"
-                            required>
-                    </div>
-                    {% endif %}
-
                     <button type="submit" class="btn btn-primary" id="loginBtn"
                         style="width:100%; margin-top:var(--space-md);">
                         <span id="loginBtnText">{{ _('login') }}</span>
@@ -232,13 +218,6 @@
             }
         });
 
-        function refreshCaptcha() {
-            const img = document.getElementById('captchaImage');
-            if (img) {
-                img.src = '/api/auth/captcha?' + new Date().getTime();
-            }
-        }
-
         async function doLogin(e) {
             e.preventDefault();
             const btn = document.getElementById('loginBtn');
@@ -258,7 +237,6 @@
                     body: JSON.stringify({
                         username: document.getElementById('username').value,
                         password: document.getElementById('password').value,
-                        captcha: document.getElementById('captcha') ? document.getElementById('captcha').value : null,
                     }),
                 });
                 const data = await res.json();
@@ -269,10 +247,6 @@
             } catch (err) {
                 errEl.textContent = err.message;
                 errEl.classList.add('visible');
-                refreshCaptcha();
-                if (document.getElementById('captcha')) {
-                    document.getElementById('captcha').value = '';
-                }
             } finally {
                 btn.disabled = false;
                 text.textContent = _('login');

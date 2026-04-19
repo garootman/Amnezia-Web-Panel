@@ -3,7 +3,6 @@ import base64
 import copy
 import hashlib
 import hmac
-import io
 import json
 import logging
 import os
@@ -16,10 +15,9 @@ from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, File, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from multicolorcaptcha import CaptchaGenerator
 from pydantic import BaseModel, field_validator
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -500,7 +498,6 @@ def tpl(request, template, **kwargs):
         "request": request,
         "current_user": get_current_user(request),
         "site_settings": data.get("settings", {}).get("appearance", {}),
-        "captcha_settings": data.get("settings", {}).get("captcha", {}),
         "lang": lang,
         "_": lambda text_id: _t(text_id, lang),
         "translations_json": json.dumps(TRANSLATIONS.get(lang, TRANSLATIONS.get("en", {}))),
@@ -516,7 +513,6 @@ def tpl(request, template, **kwargs):
 class LoginRequest(BaseModel):
     username: str
     password: str
-    captcha: str | None = None
 
 
 class AddServerRequest(BaseModel):
@@ -633,10 +629,6 @@ class SyncSettings(BaseModel):
     remnawave_protocol: str = "awg"
 
 
-class CaptchaSettings(BaseModel):
-    enabled: bool = False
-
-
 class SSLSettings(BaseModel):
     enabled: bool = False
     domain: str = ""
@@ -657,7 +649,6 @@ class UpdateUserRequest(BaseModel):
 class SaveSettingsRequest(BaseModel):
     appearance: AppearanceSettings
     sync: SyncSettings
-    captcha: CaptchaSettings
     ssl: SSLSettings
 
 
@@ -859,6 +850,11 @@ def _apply_schema_migrations(data: dict) -> bool:
         data["settings"].pop("telegram", None)
         changed = True
         logger.info("MIGRATION: removed settings.telegram block.")
+
+    if "captcha" in data.get("settings", {}):
+        data["settings"].pop("captcha", None)
+        changed = True
+        logger.info("MIGRATION: removed settings.captcha block.")
 
     if "api_keys" not in data:
         data["api_keys"] = []
@@ -1166,19 +1162,6 @@ async def users_page(request: Request):
 # ======================== AUTH API ========================
 
 
-@app.get("/api/auth/captcha")
-async def api_captcha(request: Request):
-    generator = CaptchaGenerator(2)
-    captcha = generator.gen_captcha_image(difficult_level=2)
-    request.session["captcha_answer"] = captcha.characters
-
-    img_bytes = io.BytesIO()
-    captcha.image.save(img_bytes, format="PNG")
-    img_bytes.seek(0)
-
-    return StreamingResponse(img_bytes, media_type="image/png")
-
-
 # Per-IP login failure tracking. Exponential backoff caps at 30s. Resets on successful login.
 _LOGIN_FAILURES: dict[str, tuple[int, float]] = {}
 _LOGIN_FAILURE_WINDOW = 900  # 15 minutes
@@ -1221,16 +1204,6 @@ async def api_login(request: Request, req: LoginRequest):
         await asyncio.sleep(backoff)
 
     data = load_data()
-    captcha_settings = data.get("settings", {}).get("captcha", {})
-    if captcha_settings.get("enabled") is True:
-        answer = request.session.get("captcha_answer")
-        lang = request.cookies.get("lang", "ru")
-        if not answer or not req.captcha or answer.lower() != req.captcha.lower():
-            request.session.pop("captcha_answer", None)
-            _record_login_failure(ip)
-            return JSONResponse({"error": _t("invalid_captcha", lang)}, status_code=400)
-        request.session.pop("captcha_answer", None)
-
     admin = data.get("admin") or {}
     if admin.get("username") == req.username and verify_password(req.password, admin.get("password_hash", "")):
         request.session["user_id"] = admin["id"]
@@ -2481,7 +2454,6 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     data = load_data()
     data["settings"]["appearance"] = payload.appearance.dict()
     data["settings"]["sync"] = payload.sync.dict()
-    data["settings"]["captcha"] = payload.captcha.dict()
     data["settings"]["ssl"] = payload.ssl.dict()
     await save_data_async(data)
     logger.info("Settings saved")

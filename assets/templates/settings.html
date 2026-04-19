@@ -32,19 +32,6 @@
             </form>
         </div>
 
-        <!-- BLOCK Captcha -->
-        <div class="card">
-            <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _('captcha_title') }}</h3>
-            <form id="captchaForm">
-                <div class="form-group">
-                    <label class="form-label">
-                        <input type="checkbox" id="captcha_enabled" {% if captcha_settings.enabled %}checked{% endif %}>
-                        {{ _('enable_captcha') }}
-                    </label>
-                </div>
-            </form>
-        </div>
-
         <!-- BLOCK 4: API Docs -->
         <div class="card">
             <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _('api_docs_title') }}</h3>
@@ -418,10 +405,6 @@
         };
 
 
-        const captcha = {
-            enabled: document.getElementById('captcha_enabled').checked
-        };
-
         const ssl = {
             enabled: document.getElementById('ssl_enabled').checked,
             domain: document.getElementById('ssl_domain').value.trim(),
@@ -435,7 +418,7 @@
             const res = await fetch('/api/settings/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appearance, sync, captcha, ssl })
+                body: JSON.stringify({ appearance, sync, ssl })
             });
             if (!res.ok) throw new Error(_('error'));
             showToast(_('settings_saved'), 'success');
