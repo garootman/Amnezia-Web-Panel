@@ -68,6 +68,11 @@
                 <input class="form-input" type="email" id="newEmail" placeholder="user@example.com">
             </div>
 
+            <div class="form-group">
+                <label class="form-label">External ID</label>
+                <input class="form-input" type="text" id="newExternalId" placeholder="billing-system-id">
+            </div>
+
             <div class="grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
                 <div class="form-group">
                     <label class="form-label">{{ _('traffic_limit_label') }}</label>
@@ -175,6 +180,10 @@
             <div class="form-group">
                 <label class="form-label">{{ _('edit_user_email') }}</label>
                 <input type="email" class="form-input" id="editUserEmail" placeholder="user@example.com">
+            </div>
+            <div class="form-group">
+                <label class="form-label">External ID</label>
+                <input type="text" class="form-input" id="editUserExternalId" placeholder="billing-system-id">
             </div>
             <div class="grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
                 <div class="form-group">
@@ -453,7 +462,7 @@
                                 onclick="openAddConnectionForUser('${u.id}', '${u.username}')"
                                 title="${_('add_connection')}">🔗</button>
                         <button class="btn btn-secondary btn-sm btn-icon"
-                                onclick='openEditUser({"id": "${u.id}", "username": "${u.username}", "email": "${u.email || ""}", "desc": "${u.description || ""}", "limit": "${u.traffic_limit ? (u.traffic_limit / Math.pow(1024, 3)).toFixed(2) : 0}", "strategy": "${u.traffic_reset_strategy || 'never'}", "expiration": "${u.expiration_date || ''}"})'
+                                onclick='openEditUser({"id": "${u.id}", "username": "${u.username}", "email": "${u.email || ""}", "desc": "${u.description || ""}", "external_id": "${u.external_id || ""}", "limit": "${u.traffic_limit ? (u.traffic_limit / Math.pow(1024, 3)).toFixed(2) : 0}", "strategy": "${u.traffic_reset_strategy || 'never'}", "expiration": "${u.expiration_date || ''}"})'
                                 title="${_('edit')}">✏️</button>
                         <button class="btn btn-secondary btn-sm btn-icon" onclick="openShareModal(this.dataset)"
                                 data-id="${u.id}" data-username="${u.username}" data-token="${u.share_token || ''}"
@@ -565,6 +574,7 @@
                 username: document.getElementById('newUsername').value,
                 email: document.getElementById('newEmail').value || null,
                 description: document.getElementById('newDescription').value || null,
+                external_id: document.getElementById('newExternalId').value || null,
                 traffic_limit: parseFloat(document.getElementById('newTrafficLimit').value || '0'),
                 traffic_reset_strategy: document.getElementById('newTrafficResetStrategy').value,
                 expiration_date: document.getElementById('newExpirationDate').value || null,
@@ -864,6 +874,7 @@
         document.getElementById('editUserId').value = data.id;
         document.getElementById('editUserTitle').textContent = data.username;
         document.getElementById('editUserEmail').value = data.email || '';
+        document.getElementById('editUserExternalId').value = data.external_id || '';
         document.getElementById('editUserDesc').value = data.desc || '';
         document.getElementById('editUserLimit').value = data.limit || '0';
         document.getElementById('editUserTrafficResetStrategy').value = data.strategy || 'never';
@@ -880,6 +891,7 @@
         const payload = {
             email: document.getElementById('editUserEmail').value,
             description: document.getElementById('editUserDesc').value,
+            external_id: document.getElementById('editUserExternalId').value,
             traffic_limit: parseFloat(document.getElementById('editUserLimit').value || '0'),
             traffic_reset_strategy: document.getElementById('editUserTrafficResetStrategy').value,
             expiration_date: document.getElementById('editUserExpiration').value || null,

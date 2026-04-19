@@ -594,6 +594,7 @@ class AddUserRequest(BaseModel):
     username: str
     email: str | None = None
     description: str | None = None
+    external_id: str | None = None
     traffic_limit: float | None = 0
     traffic_reset_strategy: str | None = "never"
     server_id: int | None = None
@@ -641,6 +642,7 @@ class SSLSettings(BaseModel):
 class UpdateUserRequest(BaseModel):
     email: str | None = None
     description: str | None = None
+    external_id: str | None = None
     traffic_limit: float | None = 0
     traffic_reset_strategy: str | None = None
     expiration_date: str | None = None
@@ -2016,14 +2018,19 @@ async def api_add_user(request: Request, req: AddUserRequest):
     try:
         data = load_data()
         lang = request.cookies.get("lang", "ru")
-        # Check duplicate
+        # Check duplicate username
         if any(u["username"] == req.username for u in data.get("users", [])):
             return JSONResponse({"error": _t("user_exists", lang)}, status_code=400)
+        # Check duplicate external_id
+        ext_id = req.external_id.strip() if req.external_id else None
+        if ext_id and any(u.get("external_id") == ext_id for u in data.get("users", [])):
+            return JSONResponse({"error": "external_id already in use"}, status_code=400)
         new_user = {
             "id": str(uuid.uuid4()),
             "username": req.username,
             "email": req.email,
             "description": req.description,
+            "external_id": ext_id or None,
             "traffic_limit": int(req.traffic_limit * 1024**3) if req.traffic_limit else 0,
             "traffic_reset_strategy": req.traffic_reset_strategy or "never",
             "traffic_used": 0,
@@ -2114,6 +2121,11 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
             user["email"] = req.email
         if req.description is not None:
             user["description"] = req.description
+        if req.external_id is not None:
+            ext_id = req.external_id.strip() or None
+            if ext_id and any(u.get("external_id") == ext_id and u["id"] != user_id for u in data.get("users", [])):
+                return JSONResponse({"error": "external_id already in use"}, status_code=400)
+            user["external_id"] = ext_id
         if req.traffic_limit is not None:
             new_limit = int(req.traffic_limit * 1024**3)
             user["traffic_limit"] = new_limit
